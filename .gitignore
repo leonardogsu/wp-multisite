@@ -1,0 +1,39 @@
+# Variables de entorno
+.env
+
+# WordPress
+www/*/wp-config.php
+www/*/wp-content/uploads/
+www/*/wp-content/cache/
+www/*/wp-content/upgrade/
+www/*/wp-content/backups/
+
+# MySQL
+op1/mysql/data/
+
+# Logs
+logs/
+*.log
+
+# Backups
+backups/
+
+# Certificados SSL
+certbot/conf/
+certbot/www/
+
+# Archivos temporales
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Docker
+.docker/
