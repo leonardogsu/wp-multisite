@@ -1,0 +1,52 @@
+<?php
+/**
+ * WordPress Configuration
+ * Site: ${DOMAIN}
+ * Generated: ${DATE}
+ */
+
+// ** MySQL settings ** //
+define('DB_NAME', 'wp_sitio${SITE_NUM}');
+define('DB_USER', 'wpuser');
+define('DB_PASSWORD', '${DB_PASSWORD}');
+define('DB_HOST', 'mysql');
+define('DB_CHARSET', 'utf8mb4');
+define('DB_COLLATE', 'utf8mb4_unicode_ci');
+
+// ** Authentication Unique Keys and Salts ** //
+${SALT_KEYS}
+
+// ** WordPress Database Table prefix ** //
+$table_prefix = 'wp_';
+
+// ** For developers: WordPress debugging mode ** //
+define('WP_DEBUG', false);
+define('WP_DEBUG_LOG', false);
+define('WP_DEBUG_DISPLAY', false);
+
+// ** Additional settings ** //
+define('DISALLOW_FILE_EDIT', true);
+define('WP_POST_REVISIONS', 5);
+define('EMPTY_TRASH_DAYS', 30);
+define('WP_MEMORY_LIMIT', '256M');
+define('WP_MAX_MEMORY_LIMIT', '512M');
+define('WPLANG', 'es_ES');
+
+// ** SFTP Configuration ** //
+define('FTP_USER', '${SFTP_USER}');
+define('FTP_PASS', '${SFTP_PASSWORD}');
+define('FTP_HOST', '${SFTP_HOST}:${SFTP_PORT}');
+define('FTP_METHOD', 'ssh2');
+
+// ** Force HTTPS (uncomment after SSL setup) ** //
+// define('FORCE_SSL_ADMIN', true);
+// if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+//     \$_SERVER['HTTPS'] = 'on';
+// }
+
+/** Absolute path to the WordPress directory. */
+if ( !defined('ABSPATH') )
+    define('ABSPATH', dirname(__FILE__) . '/');
+
+/** Sets up WordPress vars and included files. */
+require_once(ABSPATH . 'wp-settings.php');
