@@ -3,7 +3,7 @@
 ################################################################################
 # Script refactorizado para generar configuraciones del proyecto
 # Usa plantillas externas para máxima mantenibilidad
-# VERSIÓN CORREGIDA
+# VERSIÓN CORREGIDA - Con nombres basados en dominio
 ################################################################################
 
 set -euo pipefail
@@ -26,6 +26,13 @@ log() { echo -e "${GREEN}[$(date +'%H:%M:%S')]${NC} $*"; }
 info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
+
+# Función para sanitizar nombre de dominio
+sanitize_domain_name() {
+    local domain="$1"
+    # Convertir puntos en guiones bajos y eliminar caracteres especiales
+    echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
+}
 
 # Verificar requisitos
 check_requirements() {
@@ -97,19 +104,47 @@ setup_phpmyadmin_credentials() {
 setup_sftp_credentials() {
     log "Configurando usuarios SFTP independientes..."
 
-    # Verificar si ya existen credenciales SFTP
-    if ! grep -q "^SFTP_SITIO1_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
+    # Verificar si ya existen credenciales SFTP para el primer dominio
+    local first_domain_sanitized=$(sanitize_domain_name "${DOMAINS[0]}")
+    if ! grep -q "^SFTP_${first_domain_sanitized^^}_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
         {
             echo ""
             echo "# SFTP - Usuarios independientes por sitio"
         } >> "$ENV_FILE"
 
         for i in "${!DOMAINS[@]}"; do
+            local domain="${DOMAINS[$i]}"
+            local domain_sanitized=$(sanitize_domain_name "$domain")
+            local password
+            password=$(pwgen -s 24 1)
+            echo "SFTP_${domain_sanitized^^}_PASSWORD=$password" >> "$ENV_FILE"
+            info "  Usuario ${domain}: sftp_${domain_sanitized} / $password"
+        done
+
+        # Recargar .env
+        set -a
+        source "$ENV_FILE"
+        set +a
+    fi
+}
+
+# Setup credenciales de DB por sitio
+setup_db_credentials() {
+    log "Configurando credenciales de base de datos por sitio..."
+
+    # Verificar si ya existen credenciales DB
+    if ! grep -q "^DB_PASSWORD_1=" "$ENV_FILE" 2>/dev/null; then
+        {
+            echo ""
+            echo "# Database passwords por sitio"
+        } >> "$ENV_FILE"
+
+        for i in "${!DOMAINS[@]}"; do
             local site_num=$((i + 1))
             local password
             password=$(pwgen -s 24 1)
-            echo "SFTP_SITIO${site_num}_PASSWORD=$password" >> "$ENV_FILE"
-            info "  Usuario sitio${site_num}: sftp_sitio${site_num} / $password"
+            echo "DB_PASSWORD_${site_num}=$password" >> "$ENV_FILE"
+            info "  DB password sitio ${site_num}: $password"
         done
 
         # Recargar .env
@@ -126,18 +161,20 @@ generate_docker_compose() {
     # Construir volúmenes SFTP
     local sftp_volumes=""
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        sftp_volumes+="      - ./www/sitio${site_num}:/home/sftp_sitio${site_num}/sitio${site_num}:rw"$'\n'
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        sftp_volumes+="      - ./www/${domain_sanitized}:/home/sftp_${domain_sanitized}/${domain_sanitized}:rw"$'\n'
     done
     sftp_volumes="${sftp_volumes%$'\n'}"
 
     # Construir usuarios SFTP
     local sftp_users=""
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local password_var="SFTP_SITIO${site_num}_PASSWORD"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
         local password="${!password_var}"
-        sftp_users+="      sftp_sitio${site_num}:${password}:33:33:sitio${site_num}"$'\n'
+        sftp_users+="      sftp_${domain_sanitized}:${password}:33:33:${domain_sanitized}"$'\n'
     done
     sftp_users="${sftp_users%$'\n'}"
 
@@ -168,18 +205,20 @@ generate_vhost() {
     local domain="$1"
     local site_num="$2"
     local is_first="${3:-false}"
+    local domain_sanitized=$(sanitize_domain_name "$domain")
     local output_file="nginx/conf.d/${domain}.conf"
 
-    log "  → $domain (sitio$site_num)"
+    log "  → $domain → ${domain_sanitized}"
 
     # Variables para las plantillas
     export DOMAIN="$domain"
     export SITE_NUM="$site_num"
+    export DOMAIN_SANITIZED="$domain_sanitized"
     export DATE="$(date)"
 
     # Generar bloque HTTP
     # Primero procesamos las variables de plantilla, luego convertimos $$ a $
-    envsubst '${DOMAIN} ${SITE_NUM} ${DATE}' < "${TEMPLATE_DIR}/vhost-http.conf.template" | \
+    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' < "${TEMPLATE_DIR}/vhost-http.conf.template" | \
         sed 's/\$\$/$/g' > "$output_file"
 
     # Añadir phpMyAdmin si es el primer dominio
@@ -193,7 +232,7 @@ generate_vhost() {
 
     # Añadir bloque HTTPS (comentado)
     echo "" >> "$output_file"
-    envsubst '${DOMAIN} ${SITE_NUM} ${DATE}' < "${TEMPLATE_DIR}/vhost-https.conf.template" | \
+    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' < "${TEMPLATE_DIR}/vhost-https.conf.template" | \
         sed 's/\$\$/$/g' >> "$output_file"
 
     # Añadir phpMyAdmin HTTPS si es el primer dominio
@@ -204,7 +243,7 @@ generate_vhost() {
         echo "# }" >> "$output_file"
     fi
 
-    unset DOMAIN SITE_NUM DATE
+    unset DOMAIN SITE_NUM DOMAIN_SANITIZED DATE
 }
 
 # Generar todos los vhosts
@@ -240,13 +279,14 @@ generate_mysql_configs() {
     {
         echo "-- Script de inicialización de bases de datos WordPress"
         echo "-- Generado: $(date)"
-        echo "-- NOTA: El usuario wpuser se crea desde setup.sh"
+        echo "-- NOTA: Los usuarios se crean desde setup.sh"
         echo ""
         echo "-- Crear bases de datos"
 
         for i in "${!DOMAINS[@]}"; do
-            local site_num=$((i + 1))
-            echo "CREATE DATABASE IF NOT EXISTS wp_sitio$site_num CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+            local domain="${DOMAINS[$i]}"
+            local domain_sanitized=$(sanitize_domain_name "$domain")
+            echo "CREATE DATABASE IF NOT EXISTS ${domain_sanitized} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         done
 
         echo ""
@@ -272,13 +312,30 @@ show_summary() {
     cat << EOF
 
 ${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}
-${GREEN}✔ CONFIGURACIÓN COMPLETADA${NC}
+${GREEN}✓ CONFIGURACIÓN COMPLETADA${NC}
 ${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}
 
 ${YELLOW}phpMyAdmin:${NC}
   URL: http://${DOMAINS[0]}/phpmyadmin/
   Auth HTTP → Usuario: $user | Contraseña: $password
-  MySQL → Servidor: mysql | Usuario: root/wpuser
+  MySQL → Servidor: mysql | Usuario: root/wpuser_*
+
+${YELLOW}Usuarios MySQL por sitio:${NC}
+EOF
+
+    for i in "${!DOMAINS[@]}"; do
+        local site_num=$((i + 1))
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local password_var="DB_PASSWORD_${site_num}"
+        local password="${!password_var}"
+        echo "  ${domain}:"
+        echo "    Base de datos: ${domain_sanitized}"
+        echo "    Usuario: wpuser_${domain_sanitized}"
+        echo "    Contraseña: ${password}"
+    done
+
+    cat << EOF
 
 ${YELLOW}Usuarios SFTP independientes:${NC}
   Host: $SERVER_IP:2222
@@ -286,12 +343,15 @@ ${YELLOW}Usuarios SFTP independientes:${NC}
 EOF
 
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local password_var="SFTP_SITIO${site_num}_PASSWORD"
-        echo "  Sitio ${site_num} (${DOMAINS[$((i))]})"
-        echo "    Usuario: sftp_sitio${site_num}"
-        echo "    Directorio enjaulado: /sitio${site_num}"
-        echo "    Comando: sftp -P 2222 sftp_sitio${site_num}@$SERVER_IP"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
+        local password="${!password_var}"
+        echo "  ${domain}:"
+        echo "    Usuario: sftp_${domain_sanitized}"
+        echo "    Carpeta: ${domain_sanitized}"
+        echo "    Directorio enjaulado: /${domain_sanitized}"
+        echo "    Comando: sftp -P 2222 sftp_${domain_sanitized}@$SERVER_IP"
     done
 
     cat << EOF
@@ -310,6 +370,7 @@ main() {
     check_requirements
     load_env
     setup_phpmyadmin_credentials
+    setup_db_credentials
     setup_sftp_credentials
     generate_docker_compose
     generate_nginx_conf

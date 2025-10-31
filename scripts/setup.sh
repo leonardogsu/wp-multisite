@@ -3,7 +3,7 @@
 ################################################################################
 # Script de Setup - Descarga WordPress y configura sitios
 # Versión refactorizada usando plantillas
-# VERSIÓN CORREGIDA
+# VERSIÓN CORREGIDA - Con nombres basados en dominio
 ################################################################################
 
 set -euo pipefail
@@ -28,11 +28,18 @@ info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
 
+# Función para sanitizar nombre de dominio
+sanitize_domain_name() {
+    local domain="$1"
+    # Convertir puntos en guiones bajos y eliminar caracteres especiales
+    echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
+}
+
 # Banner
 show_banner() {
-    log "══════════════════════════════════════════════════"
+    log "╔══════════════════════════════════════════════════╗"
     log "SETUP DE WORDPRESS MULTI-SITE"
-    log "══════════════════════════════════════════════════"
+    log "╚══════════════════════════════════════════════════╝"
     echo ""
 }
 
@@ -77,9 +84,10 @@ download_wordpress() {
 setup_site() {
     local site_num="$1"
     local domain="$2"
-    local site_dir="www/sitio${site_num}"
+    local domain_sanitized=$(sanitize_domain_name "$domain")
+    local site_dir="www/${domain_sanitized}"
 
-    log "  Configurando sitio $site_num: $domain"
+    log "  Configurando sitio $site_num: $domain → ${domain_sanitized}"
 
     # Crear directorio si no existe
     if [[ -d "$site_dir" ]]; then
@@ -92,7 +100,7 @@ setup_site() {
     # Extraer WordPress
     tar -xzf "$WP_DOWNLOAD" -C /tmp/
     cp -r /tmp/wordpress/* "$site_dir/"
-    log "    ✔ WordPress extraído"
+    log "    ✓ WordPress extraído"
 
     # Generar wp-config.php usando plantilla
     log "    Generando wp-config.php..."
@@ -108,24 +116,31 @@ setup_site() {
     # Exportar variables para envsubst
     export DOMAIN="$domain"
     export SITE_NUM="$site_num"
-    export DB_PASSWORD="${DB_PASSWORD}"
+    export DOMAIN_SANITIZED="$domain_sanitized"
+    export DB_NAME="${domain_sanitized}"
+    export DB_USER="wpuser_${domain_sanitized}"
+
+    # Obtener la contraseña específica del sitio
+    local db_password_var="DB_PASSWORD_${site_num}"
+    export DB_PASSWORD="${!db_password_var}"
+
     export DATE="$(date)"
     export SALT_KEYS="$salt_keys"
 
     # Variables SFTP
-    local sftp_password_var="SFTP_SITIO${site_num}_PASSWORD"
-    export SFTP_USER="sftp_sitio${site_num}"
+    local sftp_password_var="SFTP_${domain_sanitized^^}_PASSWORD"
+    export SFTP_USER="sftp_${domain_sanitized}"
     export SFTP_PASSWORD="${!sftp_password_var}"
     export SFTP_HOST="${SERVER_IP}"
     export SFTP_PORT="2222"
 
     # Generar wp-config.php
-    envsubst '${DOMAIN} ${SITE_NUM} ${DB_PASSWORD} ${DATE} ${SALT_KEYS} ${SFTP_USER} ${SFTP_PASSWORD} ${SFTP_HOST} ${SFTP_PORT}' \
+    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DB_NAME} ${DB_USER} ${DB_PASSWORD} ${DATE} ${SALT_KEYS} ${SFTP_USER} ${SFTP_PASSWORD} ${SFTP_HOST} ${SFTP_PORT}' \
       < "${TEMPLATE_DIR}/wp-config.php.template" > "${site_dir}/wp-config.php"
 
-    unset DOMAIN SITE_NUM DATE SALT_KEYS SFTP_USER SFTP_PASSWORD SFTP_HOST SFTP_PORT
+    unset DOMAIN SITE_NUM DOMAIN_SANITIZED DB_NAME DB_USER DB_PASSWORD DATE SALT_KEYS SFTP_USER SFTP_PASSWORD SFTP_HOST SFTP_PORT
 
-    log "    ✔ wp-config.php generado"
+    log "    ✓ wp-config.php generado"
 }
 
 # Configurar todos los sitios
@@ -149,7 +164,7 @@ set_permissions() {
     find www/ -type d -exec chmod 755 {} \;
     find www/ -type f -exec chmod 644 {} \;
 
-    log "✔ Permisos ajustados"
+    log "✓ Permisos ajustados"
 }
 
 # Iniciar contenedores Docker
@@ -166,7 +181,7 @@ start_containers() {
     log "  Iniciando contenedores..."
     docker compose up -d || error "Error al iniciar contenedores"
 
-    log "✔ Contenedores iniciados"
+    log "✓ Contenedores iniciados"
 }
 
 # Esperar a MySQL
@@ -201,25 +216,21 @@ wait_for_mysql() {
 verify_databases() {
     log "Paso 6: Verificando bases de datos..."
 
-    # Primero, eliminar el usuario wpuser si existe (para empezar limpio)
-    log "  Limpiando usuario wpuser previo..."
-    docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
-        -e "DROP USER IF EXISTS 'wpuser'@'%';" 2>/dev/null || true
-
-    # Crear usuario wpuser con la contraseña correcta
-    log "  Creando usuario wpuser..."
-    docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
-        -e "CREATE USER 'wpuser'@'%' IDENTIFIED BY '${DB_PASSWORD}';" || \
-        error "No se pudo crear el usuario wpuser"
-
-    log "  ✔ Usuario wpuser creado"
-
-    # Verificar cada base de datos y otorgar permisos
+    # Verificar cada base de datos y crear usuarios
     for i in "${!DOMAINS[@]}"; do
         local site_num=$((i + 1))
-        local db_name="wp_sitio${site_num}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local db_name="${domain_sanitized}"
+        local db_user="wpuser_${domain_sanitized}"
+        local db_password_var="DB_PASSWORD_${site_num}"
+        local db_password="${!db_password_var}"
 
-        log "  Configurando: $db_name"
+        log "  Configurando: $domain → DB: $db_name | Usuario: $db_user"
+
+        # Eliminar usuario previo si existe
+        docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
+            -e "DROP USER IF EXISTS '${db_user}'@'%';" 2>/dev/null || true
 
         # Crear base de datos si no existe
         docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
@@ -228,14 +239,21 @@ verify_databases() {
             continue
         }
 
+        # Crear usuario específico del sitio
+        docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
+            -e "CREATE USER '${db_user}'@'%' IDENTIFIED BY '${db_password}';" || {
+            warning "    No se pudo crear usuario $db_user"
+            continue
+        }
+
         # Otorgar permisos
         docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
-            -e "GRANT ALL PRIVILEGES ON $db_name.* TO 'wpuser'@'%';" || {
+            -e "GRANT ALL PRIVILEGES ON $db_name.* TO '${db_user}'@'%';" || {
             warning "    No se pudieron otorgar permisos a $db_name"
             continue
         }
 
-        log "    ✔ $db_name configurada"
+        log "    ✓ $db_name configurada con usuario $db_user"
     done
 
     # Aplicar cambios
@@ -251,8 +269,13 @@ verify_php_connection() {
 
     for i in "${!DOMAINS[@]}"; do
         local site_num=$((i + 1))
-        local db_name="wp_sitio${site_num}"
-        local test_script="www/sitio${site_num}/test-db.php"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local db_name="${domain_sanitized}"
+        local db_user="wpuser_${domain_sanitized}"
+        local db_password_var="DB_PASSWORD_${site_num}"
+        local db_password="${!db_password_var}"
+        local test_script="www/${domain_sanitized}/test-db.php"
 
         log "  Probando conexión a $db_name..."
 
@@ -260,8 +283,8 @@ verify_php_connection() {
         cat > "$test_script" << EOF
 <?php
 \$host = 'mysql';
-\$user = 'wpuser';
-\$pass = '${DB_PASSWORD}';
+\$user = '${db_user}';
+\$pass = '${db_password}';
 \$db = '${db_name}';
 
 \$conn = new mysqli(\$host, \$user, \$pass, \$db);
@@ -277,10 +300,10 @@ EOF
 
         # Ejecutar test
         local result
-        result=$(docker compose exec -T php php "/var/www/html/sitio${site_num}/test-db.php" 2>&1)
+        result=$(docker compose exec -T php php "/var/www/html/${domain_sanitized}/test-db.php" 2>&1)
 
         if echo "$result" | grep -q "^OK"; then
-            log "    ✔ Conexión exitosa a $db_name"
+            log "    ✓ Conexión exitosa a $db_name"
         else
             warning "    ⚠ Problema de conexión a $db_name"
             if [[ -n "$result" ]]; then
@@ -298,9 +321,9 @@ EOF
 
 # Mostrar información final
 show_summary() {
-    log "══════════════════════════════════════════════════"
+    log "╔══════════════════════════════════════════════════╗"
     log "SETUP COMPLETADO EXITOSAMENTE"
-    log "══════════════════════════════════════════════════"
+    log "╚══════════════════════════════════════════════════╝"
     echo ""
 
     info "Contenedores en ejecución:"
@@ -310,21 +333,35 @@ show_summary() {
     info "Sitios configurados:"
     for i in "${!DOMAINS[@]}"; do
         local site_num=$((i + 1))
-        echo "  $site_num. ${DOMAINS[$i]} → http://${DOMAINS[$i]}"
-        echo "      Base de datos: wp_sitio$site_num"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "  $site_num. ${domain} → http://${domain}"
+        echo "      Carpeta: ${domain_sanitized}"
+        echo "      Base de datos: ${domain_sanitized}"
+        echo "      Usuario DB: wpuser_${domain_sanitized}"
     done
     echo ""
 
     info "CREDENCIALES:"
     echo "  MySQL Root: root / ${MYSQL_ROOT_PASSWORD}"
-    echo "  MySQL User: wpuser / ${DB_PASSWORD}"
+    echo ""
+    echo "  Usuarios MySQL por sitio:"
+    for i in "${!DOMAINS[@]}"; do
+        local site_num=$((i + 1))
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local password_var="DB_PASSWORD_${site_num}"
+        local password="${!password_var:-N/A}"
+        echo "    ${domain}: wpuser_${domain_sanitized} / ${password}"
+    done
     echo ""
     echo "  SFTP (usuarios independientes):"
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local password_var="SFTP_SITIO${site_num}_PASSWORD"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
         local password="${!password_var:-N/A}"
-        echo "    Sitio ${site_num}: sftp_sitio${site_num} / ${password}"
+        echo "    ${domain}: sftp_${domain_sanitized} / ${password}"
     done
     echo ""
 
@@ -335,9 +372,10 @@ show_summary() {
     echo ""
     echo "  Accesos SFTP por sitio:"
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "    Sitio ${site_num}: sftp -P 2222 sftp_sitio${site_num}@${SERVER_IP}"
-        echo "    Directorio: /sitio${site_num}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "    ${domain}: sftp -P 2222 sftp_${domain_sanitized}@${SERVER_IP}"
+        echo "    Directorio: /${domain_sanitized}"
     done
     echo ""
 

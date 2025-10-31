@@ -4,7 +4,7 @@
 # WordPress Multi-Site - Instalador Automático Completo
 # Versión refactorizada usando sistema de plantillas
 # Para Ubuntu 24.04 LTS
-# VERSIÓN ACTUALIZADA - SFTP + NETDATA
+# VERSIÓN ACTUALIZADA - SFTP + NETDATA + Nombres basados en dominio
 ################################################################################
 
 set -euo pipefail
@@ -25,10 +25,10 @@ readonly NC='\033[0m'
 
 # Variables globales
 declare -a DOMAINS=()
+declare -a SFTP_PASSWORDS=()
+declare -a DB_PASSWORDS=()
 declare SERVER_IP=""
 declare MYSQL_ROOT_PASSWORD=""
-declare DB_PASSWORD=""
-declare SFTP_PASSWORD=""
 declare SETUP_CRON=false
 declare INSTALL_NETDATA=false
 
@@ -42,6 +42,13 @@ warning() { echo -e "${YELLOW}[WARNING]${NC} $*" | tee -a "$LOG_FILE"; }
 info() { echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
 success() { echo -e "${GREEN}[SUCCESS]${NC} $*" | tee -a "$LOG_FILE"; }
 banner() { echo -e "${CYAN}$*${NC}" | tee -a "$LOG_FILE"; }
+
+# Función para sanitizar nombre de dominio
+sanitize_domain_name() {
+    local domain="$1"
+    # Convertir puntos en guiones bajos y eliminar caracteres especiales
+    echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
+}
 
 # Verificar root
 check_root() {
@@ -155,7 +162,6 @@ gather_user_input() {
     [[ $setup_cron =~ ^[Ss]$ ]] && SETUP_CRON=true || SETUP_CRON=false
 
     # Pregunta sobre Netdata
-    # Netdata
     echo ""
     read -rp "¿Instalar Netdata (monitoreo en tiempo real)? (s/n): " setup_netdata
     [[ $setup_netdata =~ ^[Ss]$ ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
@@ -168,12 +174,12 @@ gather_user_input() {
     echo "  IP: $SERVER_IP"
     echo "  Sitios: ${#DOMAINS[@]}"
     for domain in "${DOMAINS[@]}"; do
-        echo "    - $domain"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "    - $domain → ${domain_sanitized}"
     done
     echo ""
     success "  ✓ phpMyAdmin: INCLUIDO"
     success "  ✓ SFTP Server: INCLUIDO (puerto 2222)"
-    # Mostrar Netdata en resumen
     [[ $INSTALL_NETDATA == true ]] && success "  ✓ Netdata: INCLUIDO (puerto 19999)"
     echo "  Backup: $([[ $SETUP_CRON == true ]] && echo 'Sí' || echo 'No')"
     echo "  Directorio: $INSTALL_DIR"
@@ -289,7 +295,6 @@ configure_firewall() {
     sleep 2
 }
 
-# Nueva función install_netdata()
 # Instalar Netdata
 install_netdata() {
     if [[ $INSTALL_NETDATA != true ]]; then
@@ -364,7 +369,7 @@ create_directories() {
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # Estructura completa (sin directorio sftp para llaves)
+    # Estructura completa
     mkdir -p {nginx/{conf.d,auth},php,mysql/{init,data},www,certbot/{conf,www},logs/{nginx,php,mysql},scripts,backups,templates}
 
     success "✓ Estructura creada en $INSTALL_DIR"
@@ -408,10 +413,10 @@ generate_credentials() {
 
     log "Generando contraseñas..."
     MYSQL_ROOT_PASSWORD=$(pwgen -s 32 1)
-    DB_PASSWORD=$(pwgen -s 32 1)
 
-    # Generar contraseña SFTP para cada sitio
+    # Generar contraseña de DB y SFTP para cada sitio
     for i in "${!DOMAINS[@]}"; do
+        DB_PASSWORDS+=("$(pwgen -s 32 1)")
         SFTP_PASSWORDS+=("$(pwgen -s 24 1)")
     done
 
@@ -425,14 +430,21 @@ generate_credentials() {
 # GUARDAR EN LUGAR SEGURO
 
 MySQL Root Password: $MYSQL_ROOT_PASSWORD
-Database Password: $DB_PASSWORD
 
-# SFTP - Usuarios independientes por sitio
+# Credenciales por sitio
 EOF
 
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "SFTP Sitio ${site_num} (${DOMAINS[$i]}): sftp_sitio${site_num} / ${SFTP_PASSWORDS[$i]}" >> "$cred_file"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "" >> "$cred_file"
+        echo "=== ${domain} ===" >> "$cred_file"
+        echo "Carpeta: ${domain_sanitized}" >> "$cred_file"
+        echo "Base de datos: ${domain_sanitized}" >> "$cred_file"
+        echo "Usuario DB: wpuser_${domain_sanitized}" >> "$cred_file"
+        echo "Password DB: ${DB_PASSWORDS[$i]}" >> "$cred_file"
+        echo "Usuario SFTP: sftp_${domain_sanitized}" >> "$cred_file"
+        echo "Password SFTP: ${SFTP_PASSWORDS[$i]}" >> "$cred_file"
     done
 
     chmod 600 "$cred_file"
@@ -445,7 +457,6 @@ EOF
 
 # MySQL
 MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-DB_PASSWORD=$DB_PASSWORD
 
 # Servidor
 SERVER_IP=$SERVER_IP
@@ -461,12 +472,20 @@ EOF
         echo "DOMAIN_$((i+1))=${DOMAINS[$i]}" >> .env
     done
 
+    # Añadir contraseñas DB por sitio
+    echo "" >> .env
+    echo "# Database passwords por sitio" >> .env
+    for i in "${!DOMAINS[@]}"; do
+        echo "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}" >> .env
+    done
+
     # Añadir contraseñas SFTP por sitio
     echo "" >> .env
     echo "# SFTP - Usuarios independientes por sitio" >> .env
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "SFTP_SITIO${site_num}_PASSWORD=${SFTP_PASSWORDS[$i]}" >> .env
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}" >> .env
     done
 
     chown root:root .env
@@ -474,13 +493,18 @@ EOF
 
     # Exportar las variables para que estén disponibles en los scripts hijos
     export MYSQL_ROOT_PASSWORD
-    export DB_PASSWORD
     export SERVER_IP
+
+    # Exportar contraseñas DB
+    for i in "${!DOMAINS[@]}"; do
+        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
+    done
 
     # Exportar contraseñas SFTP
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        export "SFTP_SITIO${site_num}_PASSWORD=${SFTP_PASSWORDS[$i]}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
     done
 
     success "✓ Archivo .env creado"
@@ -500,32 +524,16 @@ copy_templates_and_scripts() {
         cp -r "$SCRIPT_DIR/templates"/* templates/
         success "✓ Plantillas copiadas"
     else
-        warning "Plantillas no encontradas en $SCRIPT_DIR/templates"
-        warning "Intentando copiar desde ubicación alternativa..."
-
-        # Intentar encontrar las plantillas en diferentes ubicaciones
-        if [[ -f "$SCRIPT_DIR/templates_concatenados.txt" ]]; then
-            log "Extrayendo plantillas desde archivo concatenado..."
-            warning "Por favor, asegúrate de que las plantillas estén en $INSTALL_DIR/templates/"
-        fi
+        warning "Directorio templates/ no encontrado en $SCRIPT_DIR"
     fi
 
     log "Copiando scripts..."
     if [[ -d "$SCRIPT_DIR/scripts" ]]; then
-        cp "$SCRIPT_DIR"/scripts/*.sh scripts/ 2>/dev/null || true
+        cp -r "$SCRIPT_DIR/scripts"/* scripts/
         chmod +x scripts/*.sh
         success "✓ Scripts copiados"
     else
-        # Si no hay carpeta scripts, copiar los scripts individuales
-        if [[ -f "$SCRIPT_DIR/generate-config.sh" ]]; then
-            cp "$SCRIPT_DIR/generate-config.sh" scripts/
-            chmod +x scripts/generate-config.sh
-        fi
-        if [[ -f "$SCRIPT_DIR/setup.sh" ]]; then
-            cp "$SCRIPT_DIR/setup.sh" scripts/
-            chmod +x scripts/setup.sh
-        fi
-        success "✓ Scripts individuales copiados"
+        warning "Directorio scripts/ no encontrado en $SCRIPT_DIR"
     fi
 
     echo ""
@@ -539,21 +547,22 @@ generate_configurations() {
     banner "═══════════════════════════════════════════════════════════════════════"
     echo ""
 
-    # Limpiar configuraciones antiguas
-    if [[ -d "nginx/conf.d" ]]; then
-        rm -f nginx/conf.d/*.conf 2>/dev/null || true
-    fi
+    log "Generando archivos de configuración..."
 
-    log "Ejecutando generador de configuraciones..."
-    # Asegurar que las variables estén disponibles
+    # Asegurar que las variables estén exportadas
     export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    export DB_PASSWORD="${DB_PASSWORD}"
     export SERVER_IP="${SERVER_IP}"
+
+    # Exportar contraseñas DB
+    for i in "${!DOMAINS[@]}"; do
+        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
+    done
 
     # Exportar contraseñas SFTP
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        export "SFTP_SITIO${site_num}_PASSWORD=${SFTP_PASSWORDS[$i]}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
     done
 
     ./scripts/generate-config.sh || error "Error al generar configuraciones"
@@ -573,13 +582,18 @@ setup_wordpress() {
     log "Ejecutando setup de WordPress..."
     # Asegurar que las variables estén disponibles
     export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    export DB_PASSWORD="${DB_PASSWORD}"
     export SERVER_IP="${SERVER_IP}"
+
+    # Exportar contraseñas DB
+    for i in "${!DOMAINS[@]}"; do
+        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
+    done
 
     # Exportar contraseñas SFTP
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        export "SFTP_SITIO${site_num}_PASSWORD=${SFTP_PASSWORDS[$i]}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
     done
 
     ./scripts/setup.sh || error "Error en setup de WordPress"
@@ -602,53 +616,53 @@ set_wordpress_permissions() {
     log "Configurando permisos desde contenedor PHP..."
 
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
         local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
 
-        log "Configurando permisos para sitio${site_num} ($domain)..."
+        log "Configurando permisos para ${domain} (${domain_sanitized})..."
 
         # Ejecutar dentro del contenedor PHP
         docker compose exec -T php sh -c "
             # Verificar si el directorio existe
-            if [ -d '/var/www/html/sitio${site_num}' ]; then
-                echo 'Configurando permisos para sitio${site_num}...'
+            if [ -d '/var/www/html/${domain_sanitized}' ]; then
+                echo 'Configurando permisos para ${domain_sanitized}...'
 
                 # Cambiar propietario a www-data (usuario de PHP-FPM)
-                chown -R www-data:www-data /var/www/html/sitio${site_num}
+                chown -R www-data:www-data /var/www/html/${domain_sanitized}
 
                 # Permisos base
-                find /var/www/html/sitio${site_num} -type d -exec chmod 755 {} \;
-                find /var/www/html/sitio${site_num} -type f -exec chmod 644 {} \;
+                find /var/www/html/${domain_sanitized} -type d -exec chmod 755 {} \;
+                find /var/www/html/${domain_sanitized} -type f -exec chmod 644 {} \;
 
                 # Crear directorios necesarios
-                mkdir -p /var/www/html/sitio${site_num}/wp-content/uploads
-                mkdir -p /var/www/html/sitio${site_num}/wp-content/plugins
-                mkdir -p /var/www/html/sitio${site_num}/wp-content/themes
-                mkdir -p /var/www/html/sitio${site_num}/wp-content/upgrade
+                mkdir -p /var/www/html/${domain_sanitized}/wp-content/uploads
+                mkdir -p /var/www/html/${domain_sanitized}/wp-content/plugins
+                mkdir -p /var/www/html/${domain_sanitized}/wp-content/themes
+                mkdir -p /var/www/html/${domain_sanitized}/wp-content/upgrade
 
                 # Permisos COMPLETOS para wp-content (WordPress necesita crear subdirectorios)
-                chmod -R 775 /var/www/html/sitio${site_num}/wp-content
-                chown -R www-data:www-data /var/www/html/sitio${site_num}/wp-content
+                chmod -R 775 /var/www/html/${domain_sanitized}/wp-content
+                chown -R www-data:www-data /var/www/html/${domain_sanitized}/wp-content
 
                 # Asegurar que uploads tenga permisos recursivos
-                if [ -d '/var/www/html/sitio${site_num}/wp-content/uploads' ]; then
-                    chmod -R 775 /var/www/html/sitio${site_num}/wp-content/uploads
-                    find /var/www/html/sitio${site_num}/wp-content/uploads -type d -exec chmod 775 {} \;
-                    find /var/www/html/sitio${site_num}/wp-content/uploads -type f -exec chmod 664 {} \;
+                if [ -d '/var/www/html/${domain_sanitized}/wp-content/uploads' ]; then
+                    chmod -R 775 /var/www/html/${domain_sanitized}/wp-content/uploads
+                    find /var/www/html/${domain_sanitized}/wp-content/uploads -type d -exec chmod 775 {} \;
+                    find /var/www/html/${domain_sanitized}/wp-content/uploads -type f -exec chmod 664 {} \;
                 fi
 
                 echo 'Permisos configurados correctamente'
             else
-                echo 'Advertencia: directorio sitio${site_num} no encontrado'
+                echo 'Advertencia: directorio ${domain_sanitized} no encontrado'
             fi
-        " || warning "Error al configurar permisos para sitio${site_num}"
+        " || warning "Error al configurar permisos para ${domain_sanitized}"
 
         # También configurar permisos desde el host para SFTP
         log "Ajustando permisos desde host para SFTP..."
-        if [[ -d "$INSTALL_DIR/www/sitio${site_num}/wp-content" ]]; then
-            chmod -R 775 "$INSTALL_DIR/www/sitio${site_num}/wp-content" 2>/dev/null || true
+        if [[ -d "$INSTALL_DIR/www/${domain_sanitized}/wp-content" ]]; then
+            chmod -R 775 "$INSTALL_DIR/www/${domain_sanitized}/wp-content" 2>/dev/null || true
         fi
-        success "✓ Permisos configurados para sitio${site_num}"
+        success "✓ Permisos configurados para ${domain}"
     done
 
     success "✓ Permisos de WordPress configurados"
@@ -742,12 +756,17 @@ show_final_summary() {
 
     info "═══ CREDENCIALES ═══"
     echo "  MySQL Root: root / $MYSQL_ROOT_PASSWORD"
-    echo "  MySQL User: wpuser / $DB_PASSWORD"
     echo ""
-    echo "  SFTP (usuarios independientes por sitio):"
+    echo "  Credenciales por sitio:"
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "    Sitio ${site_num}: sftp_sitio${site_num} / ${SFTP_PASSWORDS[$i]}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo ""
+        echo "    ${domain}:"
+        echo "      Carpeta: ${domain_sanitized}"
+        echo "      DB: ${domain_sanitized}"
+        echo "      Usuario DB: wpuser_${domain_sanitized} / ${DB_PASSWORDS[$i]}"
+        echo "      Usuario SFTP: sftp_${domain_sanitized} / ${SFTP_PASSWORDS[$i]}"
     done
     echo ""
     warning "  También en: $INSTALL_DIR/.credentials"
@@ -755,27 +774,32 @@ show_final_summary() {
 
     info "═══ SITIOS CONFIGURADOS ═══"
     for i in "${!DOMAINS[@]}"; do
-        echo "  $((i+1)). ${DOMAINS[$i]}"
-        echo "     URL: http://${DOMAINS[$i]}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "  $((i+1)). ${domain}"
+        echo "     URL: http://${domain}"
+        echo "     Carpeta: ${domain_sanitized}"
         echo ""
     done
 
     info "═══ SERVICIOS ═══"
     echo "  phpMyAdmin: http://${DOMAINS[0]}/phpmyadmin/"
     echo "  SFTP: $SERVER_IP:2222"
-    # Añadir información de Netdata en resumen final
+
     if [[ $INSTALL_NETDATA == true ]]; then
         echo ""
         info "  Netdata (solo accesible por túnel SSH):"
         echo "    Comando: ssh -L 19999:localhost:19999 root@$SERVER_IP"
         echo "    Luego en navegador: http://localhost:19999"
     fi
+
     echo ""
     echo "  Accesos SFTP por sitio:"
     for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "    Sitio ${site_num}: sftp -P 2222 sftp_sitio${site_num}@$SERVER_IP"
-        echo "    Directorio: /sitio${site_num}"
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        echo "    ${domain}: sftp -P 2222 sftp_${domain_sanitized}@$SERVER_IP"
+        echo "    Directorio: /${domain_sanitized}"
     done
     echo ""
 
