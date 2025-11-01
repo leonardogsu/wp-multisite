@@ -4,6 +4,8 @@
 
 Sistema automatizado para desplegar múltiples sitios WordPress independientes en un único servidor Ubuntu 24.04, utilizando arquitectura containerizada con Docker.
 
+**Soporte completo para dominios y subdominios** (ej: `ejemplo.com`, `blog.ejemplo.com`, `dev.proyecto.net`, `www.sitio.com.mx`)
+
 ---
 
 ## 📋 Script Principal: `auto-install.sh`
@@ -108,20 +110,22 @@ Orquestador completo que automatiza la instalación end-to-end del sistema.
 │   └── gitignore.template
 │
 ├── www/                          # Sitios WordPress
-│   ├── sitio1/                   # Dominio 1
+│   ├── ejemplo_com/              # ejemplo.com → ejemplo_com
 │   │   ├── wp-admin/
 │   │   ├── wp-content/
 │   │   ├── wp-includes/
 │   │   └── wp-config.php
-│   ├── sitio2/                   # Dominio 2
-│   └── sitioN/                   # Dominio N
+│   ├── blog_ejemplo_com/         # blog.ejemplo.com → blog_ejemplo_com
+│   ├── dev_proyecto_net/         # dev.proyecto.net → dev_proyecto_net
+│   └── www_sitio_com_mx/         # www.sitio.com.mx → www_sitio_com_mx
 │
 ├── nginx/                        # Configuración Nginx
 │   ├── nginx.conf                # Configuración global
 │   ├── conf.d/                   # Virtual hosts
-│   │   ├── dominio1.com.conf
-│   │   ├── dominio2.com.conf
-│   │   └── dominioN.com.conf
+│   │   ├── ejemplo.com.conf      # ejemplo.com
+│   │   ├── blog.ejemplo.com.conf # blog.ejemplo.com
+│   │   ├── dev.proyecto.net.conf # dev.proyecto.net
+│   │   └── www.sitio.com.mx.conf # www.sitio.com.mx
 │   └── auth/                     # Autenticación HTTP
 │       └── .htpasswd             # phpMyAdmin
 │
@@ -145,11 +149,15 @@ Orquestador completo que automatiza la instalación end-to-end del sistema.
 └── backups/                      # Backups automáticos
     ├── YYYYMMDD_HHMMSS/
     │   ├── databases/
-    │   │   ├── wp_sitio1.sql
-    │   │   └── wp_sitioN.sql
+    │   │   ├── ejemplo_com.sql
+    │   │   ├── blog_ejemplo_com.sql
+    │   │   ├── dev_proyecto_net.sql
+    │   │   └── www_sitio_com_mx.sql
     │   └── files/
-    │       ├── sitio1.tar.gz
-    │       └── sitioN.tar.gz
+    │       ├── ejemplo_com.tar.gz
+    │       ├── blog_ejemplo_com.tar.gz
+    │       ├── dev_proyecto_net.tar.gz
+    │       └── www_sitio_com_mx.tar.gz
     └── latest -> YYYYMMDD_HHMMSS
 ```
 
@@ -179,26 +187,34 @@ Orquestador completo que automatiza la instalación end-to-end del sistema.
 ### MySQL
 **Archivos:**
 - `mysql/my.cnf`: Optimizaciones (innodb_buffer_pool_size, max_connections)
-- `mysql/init/01-init-databases.sql`: Crea bases de datos `wp_sitio1`, `wp_sitio2`, ...
+- `mysql/init/01-init-databases.sql`: Crea bases de datos por dominio (sanitizados)
 
 **Usuarios:**
 - `root` / `${MYSQL_ROOT_PASSWORD}`: Administración total
-- `wpuser` / `${DB_PASSWORD}`: Usuario WordPress (permisos en todas las DB)
+- `wpuser_{dominio_sanitizado}` / `${DB_PASSWORD_N}`: Usuario por sitio con contraseña independiente
 
 **Bases de Datos:**
 ```
-wp_sitio1  → WordPress sitio 1
-wp_sitio2  → WordPress sitio 2
-wp_sitioN  → WordPress sitio N
+ejemplo_com        → WordPress para ejemplo.com
+blog_ejemplo_com   → WordPress para blog.ejemplo.com
+dev_proyecto_net   → WordPress para dev.proyecto.net
+www_sitio_com_mx   → WordPress para www.sitio.com.mx
 ```
+
+**Nomenclatura:**
+- Puntos (`.`) → guiones bajos (`_`)
+- Guiones (`-`) → guiones bajos (`_`)
+- Todo en minúsculas
 
 ### WordPress
 **Archivos por sitio:**
-- `www/sitioN/wp-config.php`: Configuración generada desde plantilla
-    - DB_NAME: `wp_sitio{N}`
-    - DB_USER: `wpuser`
+- `www/{dominio_sanitizado}/wp-config.php`: Configuración generada desde plantilla
+    - DB_NAME: `{dominio_sanitizado}` (ej: `blog_ejemplo_com`)
+    - DB_USER: `wpuser_{dominio_sanitizado}` (ej: `wpuser_blog_ejemplo_com`)
+    - DB_PASSWORD: `${DB_PASSWORD_N}` (contraseña única por sitio)
     - DB_HOST: `mysql` (hostname del contenedor)
-    - Salts únicos por sitio
+    - Salts únicos por sitio (API WordPress)
+    - Credenciales SFTP independientes por sitio
 
 ### phpMyAdmin
 **Acceso:**
@@ -213,20 +229,22 @@ wp_sitioN  → WordPress sitio N
 ### SFTP
 **Configuración:**
 - Puerto: `2222`
-- Usuarios: `sftp_sitio1`, `sftp_sitio2`, ..., `sftp_sitioN`
-- Directorio enjaulado: `/sitioN` (cada usuario solo ve su sitio)
+- Usuarios: `sftp_{dominio_sanitizado}` (ej: `sftp_blog_ejemplo_com`)
+- Directorio enjaulado: `/{dominio_sanitizado}` (cada usuario solo ve su sitio)
 - UID/GID: `33:33` (www-data)
+- Contraseñas independientes por sitio: `${SFTP_{DOMINIO_SANITIZADO}_PASSWORD}`
 
 **Montajes:**
 ```
-./www/sitio1 → /home/sftp_sitio1/sitio1
-./www/sitio2 → /home/sftp_sitio2/sitio2
-./www/sitioN → /home/sftp_sitioN/sitioN
+./www/ejemplo_com       → /home/sftp_ejemplo_com/ejemplo_com
+./www/blog_ejemplo_com  → /home/sftp_blog_ejemplo_com/blog_ejemplo_com
+./www/dev_proyecto_net  → /home/sftp_dev_proyecto_net/dev_proyecto_net
 ```
 
 **Conexión:**
 ```bash
-sftp -P 2222 sftp_sitio1@SERVER_IP
+# Ejemplo para blog.ejemplo.com
+sftp -P 2222 sftp_blog_ejemplo_com@SERVER_IP
 ```
 
 ---
@@ -237,24 +255,31 @@ sftp -P 2222 sftp_sitio1@SERVER_IP
 # Servidor
 SERVER_IP=X.X.X.X
 
-# Dominios (mínimo 1)
-DOMAIN_1=dominio1.com
-DOMAIN_2=dominio2.com
-DOMAIN_N=dominioN.com
+# Dominios (mínimo 1, soporta subdominios)
+DOMAIN_1=ejemplo.com
+DOMAIN_2=blog.ejemplo.com
+DOMAIN_3=dev.proyecto.net
+DOMAIN_4=www.sitio.com.mx
 
 # MySQL
 MYSQL_ROOT_PASSWORD=xxxxx
-DB_PASSWORD=xxxxx
+
+# Contraseñas de base de datos por sitio
+DB_PASSWORD_1=xxxxx  # Para ejemplo.com
+DB_PASSWORD_2=xxxxx  # Para blog.ejemplo.com
+DB_PASSWORD_3=xxxxx  # Para dev.proyecto.net
+DB_PASSWORD_4=xxxxx  # Para www.sitio.com.mx
 
 # phpMyAdmin
 PHPMYADMIN_AUTH_USER=phpmyadmin
 PHPMYADMIN_AUTH_PASSWORD=xxxxx
-PMA_ABSOLUTE_URI=http://dominio1.com/phpmyadmin/
+PMA_ABSOLUTE_URI=http://ejemplo.com/phpmyadmin/
 
-# SFTP (usuarios independientes)
-SFTP_SITIO1_PASSWORD=xxxxx
-SFTP_SITIO2_PASSWORD=xxxxx
-SFTP_SITIO3_PASSWORD=xxxxx
+# SFTP (usuarios independientes por dominio)
+SFTP_EJEMPLO_COM_PASSWORD=xxxxx
+SFTP_BLOG_EJEMPLO_COM_PASSWORD=xxxxx
+SFTP_DEV_PROYECTO_NET_PASSWORD=xxxxx
+SFTP_WWW_SITIO_COM_MX_PASSWORD=xxxxx
 ```
 
 ---
@@ -265,9 +290,10 @@ SFTP_SITIO3_PASSWORD=xxxxx
 Separar configuración de código para facilitar mantenimiento y personalización.
 
 ### Variables Sustituidas con `envsubst`
-- `${DOMAIN}`: Nombre del dominio
+- `${DOMAIN}`: Nombre del dominio original (ej: `blog.ejemplo.com`)
+- `${DOMAIN_SANITIZED}`: Dominio sanitizado (ej: `blog_ejemplo_com`)
 - `${SITE_NUM}`: Número del sitio (1, 2, 3...)
-- `${DB_PASSWORD}`: Contraseña MySQL
+- `${DB_PASSWORD}`: Contraseña MySQL específica del sitio
 - `${MYSQL_ROOT_PASSWORD}`: Contraseña root MySQL
 - `${SERVER_IP}`: IP del servidor
 - `${SFTP_VOLUMES}`: Volúmenes SFTP (generados dinámicamente)
@@ -280,6 +306,30 @@ Las variables con `$$` en plantillas se convierten a `$` después de `envsubst`:
 $$uri → $uri (Nginx)
 $$request_uri → $request_uri (Nginx)
 ```
+
+### Sanitización de Nombres de Dominio
+Los dominios y subdominios se convierten en identificadores válidos para:
+- Nombres de directorios
+- Nombres de bases de datos MySQL
+- Nombres de usuario MySQL/SFTP
+- Variables de entorno
+
+**Reglas de sanitización:**
+```
+Entrada              → Salida
+──────────────────────────────────────
+ejemplo.com          → ejemplo_com
+blog.ejemplo.com     → blog_ejemplo_com
+dev.proyecto.net     → dev_proyecto_net
+www.sitio.com.mx     → www_sitio_com_mx
+sub-dominio.web.io   → sub_dominio_web_io
+```
+
+**Transformaciones aplicadas:**
+1. Puntos (`.`) → guiones bajos (`_`)
+2. Guiones (`-`) → guiones bajos (`_`)
+3. Conversión a minúsculas
+4. Eliminación de caracteres especiales
 
 ---
 
@@ -348,9 +398,10 @@ docker compose exec mysql mysql -uroot -p
 4. **Permisos WordPress**: Ejecutar `chown -R www-data:www-data www/`
 
 ### Mejoras Comunes
-1. **Agregar dominio**:
-    - Añadir `DOMAIN_N` en `.env`
+1. **Agregar dominio o subdominio**:
+    - Añadir `DOMAIN_N` en `.env` (soporta subdominios: `blog.ejemplo.com`)
     - Ejecutar `generate-config.sh` y `setup.sh`
+    - El sistema automáticamente sanitiza el nombre
 2. **Cambiar versión PHP**: Modificar imagen en `docker-compose.yml.template`
 3. **Optimizar MySQL**: Ajustar `my.cnf.template`
 4. **Añadir Redis**: Agregar servicio en `docker-compose.yml.template`
@@ -365,11 +416,13 @@ docker compose exec mysql mysql -uroot -p
 ## 📌 Notas Importantes
 
 1. **WordPress en español**: Descarga desde `https://es.wordpress.org/latest-es_ES.tar.gz`
-2. **Usuarios SFTP aislados**: Cada sitio tiene usuario independiente con directorio enjaulado
-3. **Bases de datos separadas**: Cada sitio usa `wp_sitioN` (independientes)
-4. **SSL manual**: Requiere ejecutar `setup-ssl.sh` después de apuntar DNS
-5. **Backup incluye**: Archivos WordPress + dumps MySQL por sitio
-6. **Permisos**: UID/GID 33:33 (www-data) en todos los archivos
+2. **Soporte de subdominios**: Sistema valida y acepta cualquier subdominio válido (ej: `dev.proyecto.net`, `blog.ejemplo.com`)
+3. **Sanitización automática**: Los dominios se convierten automáticamente a nombres válidos para directorios/BD (`.` y `-` → `_`)
+4. **Usuarios SFTP aislados**: Cada sitio tiene usuario independiente con directorio enjaulado y contraseña única
+5. **Bases de datos separadas**: Cada sitio usa su propia base de datos con usuario dedicado
+6. **SSL manual**: Requiere ejecutar `setup-ssl.sh` después de apuntar DNS (soporta subdominios)
+7. **Backup incluye**: Archivos WordPress + dumps MySQL por sitio
+8. **Permisos**: UID/GID 33:33 (www-data) en todos los archivos
 
 ---
 
@@ -379,12 +432,13 @@ docker compose exec mysql mysql -uroot -p
 |----------|----------|
 | MySQL no inicia | `docker compose logs mysql` - verificar contraseñas en `.env` |
 | NGINX 502 | PHP-FPM caído - `docker compose restart php` |
-| WordPress error DB | Verificar `wpuser` existe y tiene permisos |
-| SFTP permiso denegado | Verificar contraseña en `.env` - `SFTP_SITIO{N}_PASSWORD` |
+| WordPress error DB | Verificar `wpuser_{dominio_sanitizado}` existe y tiene permisos |
+| SFTP permiso denegado | Verificar contraseña en `.env` - `SFTP_{DOMINIO_SANITIZADO}_PASSWORD` |
 | phpMyAdmin acceso | Revisar `.htpasswd` y `PMA_ABSOLUTE_URI` |
+| Subdominio no resuelve | Verificar DNS apunta a `$SERVER_IP` y virtual host existe en `nginx/conf.d/` |
 
 ---
 
-**Versión**: 2.0 (Refactorizado con plantillas)  
+**Versión**: 2.1 (Refactorizado con plantillas + Soporte completo de subdominios)  
 **Compatibilidad**: Ubuntu 24.04 LTS  
 **Docker**: 24.x+ con Compose Plugin
