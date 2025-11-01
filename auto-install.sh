@@ -146,7 +146,7 @@ gather_user_input() {
         read -rp "  Dominio $counter: " domain
         [[ -z "$domain" ]] && break
 
-        if [[ $domain =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$ ]]; then
+        if [[ $domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
             DOMAINS+=("$domain")
             ((counter++))
         else

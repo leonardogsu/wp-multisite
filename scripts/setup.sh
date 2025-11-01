@@ -28,11 +28,12 @@ info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
 
-# Función para sanitizar nombre de dominio
+# Función mejorada para sanitizar subdominios
 sanitize_domain_name() {
     local domain="$1"
-    # Convertir puntos en guiones bajos y eliminar caracteres especiales
-    echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
+    # Convertir puntos y guiones en guiones bajos, eliminar caracteres especiales
+    # Mantiene la estructura completa del subdominio
+    echo "$domain" | sed 's/\./_/g' | sed 's/-/_/g' | sed 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
 }
 
 # Banner

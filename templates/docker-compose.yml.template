@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
 
   php:
-    image: wordpress:php8.2-fpm-alpine
+    image: wordpress:php8.4-fpm-alpine
     container_name: php
     volumes:
       - ./www:/var/www/html
