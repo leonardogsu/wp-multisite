@@ -180,7 +180,9 @@ generate_docker_compose() {
 
     # Asegurar que todas las variables estén exportadas
     export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    export DB_PASSWORD="${DB_PASSWORD}"
+    # Usar DB_PASSWORD_1 como DB_PASSWORD para compatibilidad con template docker-compose
+    # (aunque creamos usuarios individuales en setup.sh)
+    export DB_PASSWORD="${DB_PASSWORD_1}"
     export SERVER_IP="${SERVER_IP}"
     export PMA_ABSOLUTE_URI="${PMA_ABSOLUTE_URI:-http://${DOMAINS[0]}/phpmyadmin/}"
     export SFTP_VOLUMES="$sftp_volumes"

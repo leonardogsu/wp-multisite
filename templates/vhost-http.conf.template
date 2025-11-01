@@ -11,7 +11,7 @@ server {
         allow all;
     }
 
-    root /var/www/html/sitio${SITE_NUM};
+    root /var/www/html/${DOMAIN_SANITIZED};
     index index.php index.html index.htm;
 
     location / {

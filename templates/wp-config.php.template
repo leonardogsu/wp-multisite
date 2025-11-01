@@ -6,8 +6,8 @@
  */
 
 // ** MySQL settings ** //
-define('DB_NAME', 'wp_sitio${SITE_NUM}');
-define('DB_USER', 'wpuser');
+define('DB_NAME', '${DB_NAME}');
+define('DB_USER', '${DB_USER}');
 define('DB_PASSWORD', '${DB_PASSWORD}');
 define('DB_HOST', 'mysql');
 define('DB_CHARSET', 'utf8mb4');
@@ -40,8 +40,8 @@ define('FTP_METHOD', 'ssh2');
 
 // ** Force HTTPS (uncomment after SSL setup) ** //
 // define('FORCE_SSL_ADMIN', true);
-// if (isset(\$_SERVER['HTTP_X_FORWARDED_PROTO']) && \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
-//     \$_SERVER['HTTPS'] = 'on';
+// if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+//     $_SERVER['HTTPS'] = 'on';
 // }
 
 /** Absolute path to the WordPress directory. */
