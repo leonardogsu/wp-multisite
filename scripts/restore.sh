@@ -1,41 +1,22 @@
 #!/bin/bash
-
 ################################################################################
-# Script de Restauración - WordPress Multi-Site
-# Restaura bases de datos y archivos desde un backup
+# restore.sh - Script de restauración para WordPress Multi-Site
+# Compatible con estructura basada en dominios sanitizados
+# Versión: 2.0 - Actualizado para auto-install.sh
+#
+# Uso:
+#   ./scripts/restore.sh --all                    # Restaura todos los sitios
+#   ./scripts/restore.sh --site DOMINIO           # Restaura un sitio específico
+#   ./scripts/restore.sh --site 2                 # Restaura sitio por índice
+#   ./scripts/restore.sh --backup DIR             # Usa un backup específico
+#   ./scripts/restore.sh --all --yes              # Sin confirmación
 ################################################################################
-
-set -euo pipefail
-
-# Configuración
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || pwd)"
-readonly ENV_FILE="${PROJECT_DIR}/.env"
-readonly BACKUP_DIR="${PROJECT_DIR}/backups"
-
-# Colores
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m'
-#!/bin/bash
-# restore.sh — Restaura backups de WordPress (todos o un único sitio)
-# Opciones:
-#   --all                 Restaura TODOS los sitios del snapshot más reciente (o --backup)
-#   --site N|sitioN|DOM   Restaura un único sitio por índice (1..N), nombre (sitio3) o dominio
-#   --backup DIR          Ruta al snapshot dentro de backups/ (por defecto usa el más reciente)
-#   --yes                 No pedir confirmación
-# Ejemplos:
-#   ./scripts/restore.sh --all
-#   ./scripts/restore.sh --site 2
-#   ./scripts/restore.sh --site blog.midominio.com --backup /opt/wordpress-multisite/backups/20251028_120001
 
 set -euo pipefail
 
 # --- Paths / constantes ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || pwd)"
+LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${LOCAL_SCRIPT_DIR}/.." 2>/dev/null && pwd || pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 BACKUP_ROOT="${PROJECT_DIR}/backups"
 
@@ -45,6 +26,12 @@ log(){ echo -e "${GREEN}[$(date +'%F %T')]${NC} $*"; }
 info(){ echo -e "${BLUE}[INFO]${NC} $*"; }
 warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
 die(){ echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
+# --- Función para sanitizar nombres de dominio ---
+sanitize_domain_name() {
+    local domain="$1"
+    echo "$domain" | sed 's/\./_/g' | sed 's/-/_/g' | sed 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
+}
 
 # --- docker compose shim ---
 compose_cmd(){
@@ -57,47 +44,46 @@ compose_cmd(){
   fi
 }
 
-# --- localizar contenedor MySQL sin depender del nombre ---
+# --- localizar contenedor MySQL ---
 MYSQL_CID=""
 detect_mysql_container(){
   local DC; DC="$(compose_cmd)"
-  # 1) .env puede definir MYSQL_CONTAINER
   if [[ -n "${MYSQL_CONTAINER:-}" ]]; then
     if docker inspect "${MYSQL_CONTAINER}" &>/dev/null; then
       MYSQL_CID="${MYSQL_CONTAINER}"; return 0
     fi
   fi
-  # 2) Servicio 'mysql' de compose en este proyecto
   if [[ -n "$DC" ]]; then
     local cid
     cid=$($DC --project-directory "$PROJECT_DIR" ps -q mysql 2>/dev/null || true)
     if [[ -n "$cid" ]]; then MYSQL_CID="$cid"; return 0; fi
   fi
-  # 3) Buscar por nombre aproximado
   local guess
   guess="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/mysql/ {print $1; exit}')"
   if [[ -n "$guess" ]]; then MYSQL_CID="${guess}"; return 0; fi
-  # 4) Buscar por imagen
   guess="$(docker ps --filter 'ancestor=mysql' --format '{{.ID}}' | head -n1)"
   if [[ -n "$guess" ]]; then MYSQL_CID="${guess}"; return 0; fi
   return 1
 }
 
 wait_for_mysql(){
-  info "Comprobando MySQL en contenedor ($MYSQL_CID)..."
+  info "Verificando MySQL en contenedor ($MYSQL_CID)..."
   local tries=30
   until docker exec "$MYSQL_CID" mysqladmin ping -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent &>/dev/null; do
     ((tries--)) || die "MySQL no respondió a tiempo"
     sleep 2
   done
+  log "✓ MySQL está listo"
 }
 
-# --- Args ---
-MODE=""           # "all" | "one"
-SITE_ARG=""       # índice | sitioN | dominio
-BACKUP_DIR=""     # ruta al snapshot
+# --- Variables globales ---
+declare -a DOMAINS=()
+MODE=""
+SITE_ARG=""
+BACKUP_DIR=""
 ASSUME_YES="no"
 
+# --- Procesar argumentos ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all) MODE="all"; shift ;;
@@ -105,86 +91,142 @@ while [[ $# -gt 0 ]]; do
     --backup) BACKUP_DIR="${2:-}"; [[ -n "${BACKUP_DIR}" ]] || die "Falta ruta para --backup"; shift 2 ;;
     --yes|-y) ASSUME_YES="yes"; shift ;;
     -h|--help)
-      sed -n '1,70p' "$0"; exit 0 ;;
-    *) die "Opción no reconocida: $1" ;;
+      sed -n '1,15p' "$0"; exit 0 ;;
+    *) die "Opción no reconocida: $1 (usa --help para ayuda)" ;;
   esac
 done
 
-[[ -n "$MODE" ]] || die "Debe indicar --all o --site"
+[[ -n "$MODE" ]] || die "Debe indicar --all o --site <dominio|índice>"
 
 # --- Cargar entorno / dominios ---
-declare -a DOMAINS=()
 load_env(){
   [[ -f "$ENV_FILE" ]] || die "No existe .env en $PROJECT_DIR"
-  # shellcheck disable=SC1090
   set -a; source "$ENV_FILE"; set +a
   : "${MYSQL_ROOT_PASSWORD:?Falta MYSQL_ROOT_PASSWORD en .env}"
   mapfile -t DOMAINS < <(grep -E '^DOMAIN_' "$ENV_FILE" | cut -d'=' -f2 || true)
+
+  if ((${#DOMAINS[@]} == 0)); then
+    die "No hay dominios configurados (DOMAIN_*) en .env"
+  fi
 }
 
 # --- Seleccionar snapshot ---
 latest_backup_dir(){
   [[ -d "$BACKUP_ROOT" ]] || die "No existe ${BACKUP_ROOT}"
   local latest
-  latest="$(ls -1 "$BACKUP_ROOT" | sort -r | head -n1 || true)"
+  latest="$(ls -1t "$BACKUP_ROOT" | head -n1 || true)"
   [[ -n "$latest" ]] || die "No hay snapshots en ${BACKUP_ROOT}"
   echo "${BACKUP_ROOT}/${latest}"
 }
 
-resolve_backup_dir(){
-  if [[ -z "$BACKUP_DIR" ]]; then
-    BACKUP_DIR="$(latest_backup_dir)"
+list_available_backups(){
+  echo ""
+  info "Backups disponibles:"
+  echo ""
+
+  local backups=($(ls -1t "$BACKUP_ROOT" 2>/dev/null || true))
+
+  if [[ ${#backups[@]} -eq 0 ]]; then
+    die "No hay backups disponibles"
   fi
-  [[ -d "$BACKUP_DIR" ]] || die "Snapshot no válido: $BACKUP_DIR"
-  [[ -d "$BACKUP_DIR/databases" && -d "$BACKUP_DIR/files" ]] || die "Estructura inválida de snapshot: faltan /databases o /files"
+
+  for i in "${!backups[@]}"; do
+    local idx=$((i+1))
+    local name="${backups[$i]}"
+    local size=$(du -sh "${BACKUP_ROOT}/${name}" 2>/dev/null | cut -f1 || echo "?")
+    if [[ $i -eq 0 ]]; then
+      echo -e "  ${GREEN}${idx}. ${name}${NC} (${size}) ${BLUE}← Más reciente${NC}"
+    else
+      echo "  ${idx}. ${name} (${size})"
+    fi
+  done
+  echo ""
 }
 
-# --- Resolver sitio a partir de índice/nombre dominio ---
-# Salida: SITE_INDEX (1..N), SITE_NAME (sitioN), SITE_DOMAIN
-SITE_INDEX=0; SITE_NAME=""; SITE_DOMAIN=""
+select_backup_interactive(){
+  list_available_backups
+  local backups=($(ls -1t "$BACKUP_ROOT" 2>/dev/null))
+  echo -e "${YELLOW}Selecciona el backup a usar:${NC}"
+  read -rp "  Número [1 = más reciente]: " selection
+  selection=${selection:-1}
+  if ! [[ "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
+    die "Selección inválida"
+  fi
+  echo "${BACKUP_ROOT}/${backups[$((selection-1))]}"
+}
+
+resolve_backup_dir(){
+  # Evita que el "set -u" interrumpa si BACKUP_DIR aún no existe
+  BACKUP_DIR="${BACKUP_DIR:-}"
+
+  # Si no se pasó --backup, ofrecer selección o usar el más reciente
+  if [[ -z "$BACKUP_DIR" ]]; then
+    if [[ "$ASSUME_YES" == "yes" ]]; then
+      BACKUP_DIR="$(latest_backup_dir)"
+      info "Usando backup más reciente: $(basename "$BACKUP_DIR")"
+    else
+      list_available_backups
+      echo -e "${YELLOW}Selecciona el backup a usar:${NC}"
+      read -rp "  Número [1 = más reciente]: " selection
+      selection="${selection:-1}"
+      local backups=($(ls -1t "$BACKUP_ROOT" 2>/dev/null || true))
+      if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#backups[@]} )); then
+        BACKUP_DIR="${BACKUP_ROOT}/${backups[$((selection-1))]}"
+      else
+        warn "Selección inválida, usando el más reciente."
+        BACKUP_DIR="$(latest_backup_dir)"
+      fi
+    fi
+  fi
+
+  # Validaciones reales (ya con BACKUP_DIR asignado)
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    die "Snapshot no válido: $BACKUP_DIR"
+  fi
+  if [[ ! -d "$BACKUP_DIR/databases" || ! -d "$BACKUP_DIR/files" ]]; then
+    die "Estructura inválida: faltan /databases o /files en $BACKUP_DIR"
+  fi
+
+  echo ""
+  info "Backup seleccionado: $(basename "$BACKUP_DIR")"
+}
+
+
+# --- Detectar formato ---
+detect_backup_format(){
+  local db_dir="${BACKUP_DIR}/databases"
+  if ls "${db_dir}"/wp_sitio*.sql.gz &>/dev/null; then
+    echo "legacy"
+  elif ls "${db_dir}"/*.sql.gz &>/dev/null && ! ls "${db_dir}"/wp_sitio*.sql.gz &>/dev/null 2>&1; then
+    echo "new"
+  else
+    echo "unknown"
+  fi
+}
+
+SITE_INDEX=0; SITE_DOMAIN=""; SITE_SANITIZED=""
 resolve_site(){
   local arg="$1"
   if [[ "$arg" =~ ^[0-9]+$ ]]; then
     SITE_INDEX="$arg"
-  elif [[ "$arg" =~ ^sitio([0-9]+)$ ]]; then
-    SITE_INDEX="${BASH_REMATCH[1]}"
+    if (( SITE_INDEX < 1 || SITE_INDEX > ${#DOMAINS[@]} )); then
+      die "Índice fuera de rango: $SITE_INDEX"
+    fi
+    SITE_DOMAIN="${DOMAINS[$((SITE_INDEX-1))]}"
   else
-    # buscar por dominio exacto en DOMAINS
     for i in "${!DOMAINS[@]}"; do
       if [[ "${DOMAINS[$i]}" == "$arg" ]]; then
         SITE_INDEX=$((i+1))
+        SITE_DOMAIN="$arg"
         break
       fi
     done
+    (( SITE_INDEX == 0 )) && die "Dominio no encontrado: '$arg'"
   fi
-  (( SITE_INDEX > 0 )) || die "No se pudo resolver el sitio a partir de: '$arg'"
-  SITE_NAME="sitio${SITE_INDEX}"
-  SITE_DOMAIN="${DOMAINS[$((SITE_INDEX-1))]:-desconocido}"
+  SITE_SANITIZED=$(sanitize_domain_name "$SITE_DOMAIN")
 }
 
-# --- Utilidades de tamaño de archivo ---
 human_size(){ du -h "$1" 2>/dev/null | awk '{print $1}'; }
-
-# --- Resumen previo (un sitio) ---
-show_site_summary(){
-  local idx="$1"
-  local name="sitio${idx}"
-  local domain="${DOMAINS[$((idx-1))]:-desconocido}"
-  local f_files="${BACKUP_DIR}/files/${name}.tar.gz"
-  local f_db="${BACKUP_DIR}/databases/wp_sitio${idx}.sql.gz"
-
-  [[ -f "$f_files" ]] || warn "No existe archivo de archivos para ${name}: $f_files"
-  [[ -f "$f_db" ]] || warn "No existe dump de DB para ${name}: $f_db"
-
-  local sz_files="n/a"; [[ -f "$f_files" ]] && sz_files="$(human_size "$f_files")"
-  local sz_db="n/a";    [[ -f "$f_db" ]]    && sz_db="$(human_size "$f_db")"
-
-  echo -e "${BLUE}Resumen de restauración${NC}"
-  echo "  Sitio:   ${name}"
-  echo "  URL:     ${domain}"
-  echo "  Archivos:${sz_files}"
-  echo "  DB:      ${sz_db}"
-}
 
 confirm(){
   [[ "$ASSUME_YES" == "yes" ]] && return 0
@@ -192,357 +234,174 @@ confirm(){
   [[ "${ans:-}" =~ ^[yY]$ ]]
 }
 
-# --- Restaurar un sitio ---
+show_site_summary(){
+  local idx="$1"
+  local domain="${DOMAINS[$((idx-1))]}"
+  local domain_sanitized=$(sanitize_domain_name "$domain")
+  local format=$(detect_backup_format)
+  local f_files f_db
+
+  if [[ "$format" == "legacy" ]]; then
+    f_files="${BACKUP_DIR}/files/sitio${idx}.tar.gz"
+    f_db="${BACKUP_DIR}/databases/wp_sitio${idx}.sql.gz"
+  else
+    f_files="${BACKUP_DIR}/files/${domain_sanitized}.tar.gz"
+    f_db="${BACKUP_DIR}/databases/${domain_sanitized}.sql.gz"
+  fi
+
+  echo ""
+  echo -e "${BLUE}Resumen de restauración${NC}"
+  echo "  Sitio:    #${idx} - ${domain}"
+  echo "  Carpeta:  ${domain_sanitized}"
+  echo "  Archivos: $(human_size "$f_files" 2>/dev/null || echo 'n/a')"
+  echo "  DB:       $(human_size "$f_db" 2>/dev/null || echo 'n/a')"
+  echo ""
+}
+
+restore_database(){
+  local idx="$1"
+  local domain="${DOMAINS[$((idx-1))]}"
+  local domain_sanitized=$(sanitize_domain_name "$domain")
+  local db_name="${domain_sanitized}"
+  local db_user="wpuser_${domain_sanitized}"
+  local format=$(detect_backup_format)
+  local f_db
+
+  if [[ "$format" == "legacy" ]]; then
+    f_db="${BACKUP_DIR}/databases/wp_sitio${idx}.sql.gz"
+  else
+    f_db="${BACKUP_DIR}/databases/${domain_sanitized}.sql.gz"
+  fi
+
+  [[ -f "$f_db" ]] || { warn "No se encontró dump de DB: $f_db"; return 1; }
+
+  info "Restaurando base de datos: ${db_name}..."
+  docker exec "$MYSQL_CID" sh -c \
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"DROP DATABASE IF EXISTS \\\`${db_name}\\\`; CREATE DATABASE \\\`${db_name}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" \
+    || die "Error al recrear base de datos ${db_name}"
+
+  zcat "$f_db" | docker exec -i "$MYSQL_CID" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "${db_name}" || \
+    die "Error al importar datos a ${db_name}"
+
+  log "✓ Base de datos ${db_name} restaurada"
+}
+
+restore_files(){
+  local idx="$1"
+  local domain="${DOMAINS[$((idx-1))]}"
+  local domain_sanitized
+  domain_sanitized=$(sanitize_domain_name "$domain")
+  local site_dir="${PROJECT_DIR}/www/${domain_sanitized}"
+
+  local format
+  format=$(detect_backup_format)
+  local f_files
+
+  if [[ "$format" == "legacy" ]]; then
+    f_files="${BACKUP_DIR}/files/sitio${idx}.tar.gz"
+  else
+    f_files="${BACKUP_DIR}/files/${domain_sanitized}.tar.gz"
+  fi
+
+  if [[ ! -f "$f_files" ]]; then
+    # 🔍 Intento automático: detectar archivo por patrón
+    f_files=$(find "${BACKUP_DIR}/files" -maxdepth 1 -type f -name "*${domain_sanitized}*.tar.gz" | head -n1 || true)
+    if [[ -z "$f_files" ]]; then
+      warn "⚠ No se encontró archivo de respaldo para ${domain_sanitized}"
+      return 1
+    fi
+  fi
+
+  info "Restaurando archivos desde: $(basename "$f_files")"
+
+  # 🧩 Si existe el directorio, hacer copia de seguridad temporal
+  if [[ -d "$site_dir" ]]; then
+    local backup_name="${domain_sanitized}.bak.$(date +%Y%m%d_%H%M%S)"
+    mv "$site_dir" "${PROJECT_DIR}/www/${backup_name}"
+    info "  Backup temporal: www/${backup_name}"
+  fi
+
+  mkdir -p "${PROJECT_DIR}/www"
+
+  # 📦 Detectar carpeta interna real dentro del tar
+  local inner_dir
+  inner_dir=$(tar -tzf "$f_files" | head -1 | cut -d/ -f1)
+
+  info "Carpeta interna detectada en el backup: ${inner_dir:-<vacía>}"
+
+  # Extraer al directorio base
+  tar -xzf "$f_files" -C "${PROJECT_DIR}/www" || die "Error al extraer archivos"
+
+  # Si la carpeta interna no coincide con la esperada, la renombramos
+  if [[ -n "$inner_dir" && "$inner_dir" != "$domain_sanitized" && -d "${PROJECT_DIR}/www/${inner_dir}" ]]; then
+    mv "${PROJECT_DIR}/www/${inner_dir}" "$site_dir"
+    info "  Renombrado ${inner_dir} → ${domain_sanitized}"
+  fi
+
+  # 🛠 Ajustar permisos solo si el directorio existe tras extraer
+  if [[ -d "$site_dir" ]]; then
+    chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
+    find "$site_dir" -type d -exec chmod 755 {} \;
+    find "$site_dir" -type f -exec chmod 644 {} \;
+    if [[ -d "$site_dir/wp-content/uploads" ]]; then
+      chmod 775 "$site_dir/wp-content/uploads"
+      find "$site_dir/wp-content/uploads" -type d -exec chmod 775 {} \;
+    fi
+    log "  ✓ Archivos restaurados en www/${domain_sanitized}"
+  else
+    die "❌ No se encontró ${site_dir} tras la extracción. Estructura inesperada en el backup."
+  fi
+
+  return 0
+}
+
 restore_one(){
   local idx="$1"
-  local name="sitio${idx}"
-  local domain="${DOMAINS[$((idx-1))]:-desconocido}"
-  local f_files="${BACKUP_DIR}/files/${name}.tar.gz"
-  local f_db="${BACKUP_DIR}/databases/wp_sitio${idx}.sql.gz"
-
   show_site_summary "$idx"
-  confirm || { info "Cancelado."; return 0; }
-
-  # Archivos
-  if [[ -f "$f_files" ]]; then
-    info "Restaurando archivos de ${name}..."
-    mkdir -p "${PROJECT_DIR}/www"
-    if [[ -d "${PROJECT_DIR}/www/${name}" ]]; then
-      mv "${PROJECT_DIR}/www/${name}" "${PROJECT_DIR}/www/${name}.bak.$(date +%Y%m%d_%H%M%S)"
-    fi
-    mkdir -p "${PROJECT_DIR}/www"
-    tar -C "${PROJECT_DIR}/www" -xzf "$f_files"
-    chown -R www-data:www-data "${PROJECT_DIR}/www/${name}" || true
-  else
-    warn "No se encontró el paquete de archivos: $f_files (se omite)"
-  fi
-
-  # Base de datos
-  if [[ -f "$f_db" ]]; then
-    info "Restaurando base de datos wp_sitio${idx}..."
-    docker exec "$MYSQL_CID" sh -c \
-      "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"DROP DATABASE IF EXISTS \\\`wp_sitio${idx}\\\`; CREATE DATABASE \\\`wp_sitio${idx}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" \
-      >/dev/null
-    # Importar
-    zcat "$f_db" | docker exec -i "$MYSQL_CID" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "wp_sitio${idx}"
-  else
-    warn "No se encontró el dump de DB: $f_db (se omite)"
-  fi
-
-  echo -e "${GREEN}✓ Restauración completada para ${name} (${domain})${NC}"
+  confirm || { info "Cancelado."; return; }
+  restore_database "$idx"
+  restore_files "$idx"
+  log "✅ Restauración completada para: ${DOMAINS[$((idx-1))]}"
 }
 
-# --- Restaurar todos los sitios del snapshot ---
 restore_all(){
-  info "Iniciando restauración de TODOS los sitios desde: $BACKUP_DIR"
-  # Detectar sitios por archivos presentes, manteniendo correlación 1..N
-  local count=0
-  shopt -s nullglob
-  for f in "${BACKUP_DIR}/files"/sitio*.tar.gz; do
-    local base; base="$(basename "$f")"           # sitioN.tar.gz
-    local idx;  idx="$(sed -E 's/^sitio([0-9]+).*/\1/' <<< "$base")"
-    if [[ -n "$idx" ]]; then
-      ((count++))
-      show_site_summary "$idx"
-      echo
-    fi
+  log "Iniciando restauración de todos los sitios..."
+  for i in "${!DOMAINS[@]}"; do
+    local idx=$((i+1))
+    restore_database "$idx"
+    restore_files "$idx"
   done
-  shopt -u nullglob
-  [[ $count -gt 0 ]] || die "No se encontraron sitios en el snapshot."
-
-  confirm || { info "Cancelado."; return 0; }
-
-  # Ejecutar restauración sitio a sitio en orden
-  for f in "${BACKUP_DIR}/files"/sitio*.tar.gz; do
-    local base; base="$(basename "$f")"
-    local idx;  idx="$(sed -E 's/^sitio([0-9]+).*/\1/' <<< "$base")"
-    restore_one "$idx"
-  done
+  log "✅ Restauración completa"
 }
 
-# --- main ---
+restart_services(){
+  info "Reiniciando servicios PHP y Nginx..."
+  local DC; DC="$(compose_cmd)"
+  [[ -n "$DC" ]] && $DC --project-directory "$PROJECT_DIR" restart php nginx 2>/dev/null || true
+  log "✓ Servicios reiniciados"
+}
+
 main(){
-  log "🔁 Iniciando RESTORE"
+  log "🔄 Iniciando restauración de backup..."
+  cd "$PROJECT_DIR" || die "No se pudo acceder al proyecto"
   load_env
-  detect_mysql_container || die "No se encontró el contenedor de MySQL."
-  [[ "$(docker inspect -f '{{.State.Running}}' "$MYSQL_CID")" == "true" ]] || die "MySQL no está en ejecución ($MYSQL_CID)."
+  detect_mysql_container || die "No se encontró contenedor MySQL"
   wait_for_mysql
   resolve_backup_dir
-  info "Usando snapshot: $BACKUP_DIR"
 
-  case "$MODE" in
-    all) restore_all ;;
-    one)
-      resolve_site "$SITE_ARG"
-      restore_one "$SITE_INDEX"
-      ;;
-  esac
+  local format=$(detect_backup_format)
+  [[ "$format" == "legacy" ]] && warn "⚠ Backup detectado en formato antiguo"
 
-  log "✅ Restore finalizado"
-}
+  if [[ "$MODE" == "all" ]]; then
+    restore_all
+  else
+    resolve_site "$SITE_ARG"
+    restore_one "$SITE_INDEX"
+  fi
 
-main "$@"
-
-# Funciones de logging
-log() { echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
-warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
-info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
-
-# Verificar requisitos
-check_requirements() {
-    cd "$PROJECT_DIR" || error "No se pudo acceder al directorio del proyecto"
-    [[ -f "$ENV_FILE" ]] || error "Archivo .env no encontrado"
-    [[ -d "$BACKUP_DIR" ]] || error "Directorio de backups no encontrado"
-
-    if ! docker compose ps | grep -q "mysql.*running"; then
-        error "MySQL no está ejecutándose. Ejecuta: docker compose up -d"
-    fi
-}
-
-# Cargar variables de entorno
-load_env() {
-    set -a
-    source "$ENV_FILE"
-    set +a
-
-    mapfile -t DOMAINS < <(grep "^DOMAIN_" "$ENV_FILE" | cut -d'=' -f2)
-    readonly DOMAINS
-}
-
-# Listar backups disponibles
-list_backups() {
-    echo ""
-    log "═══════════════════════════════════════════════════════════════"
-    log "BACKUPS DISPONIBLES"
-    log "═══════════════════════════════════════════════════════════════"
-    echo ""
-
-    local backups=($(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r))
-
-    if [[ ${#backups[@]} -eq 0 ]]; then
-        warning "No hay backups disponibles"
-        exit 0
-    fi
-
-    local counter=1
-    for backup in "${backups[@]}"; do
-        local name=$(basename "$backup")
-        local date=$(echo "$name" | sed 's/_/ /g')
-        local size=$(du -sh "$backup" | cut -f1)
-        echo "  $counter) $date ($size)"
-        ((counter++))
-    done
-
-    echo ""
-}
-
-# Seleccionar backup
-select_backup() {
-    local backups=($(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r))
-
-    read -rp "Selecciona el número de backup a restaurar: " selection
-
-    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backups[@]} ]]; then
-        error "Selección inválida"
-    fi
-
-    echo "${backups[$((selection - 1))]}"
-}
-
-# Confirmar restauración
-confirm_restore() {
-    local backup_dir="$1"
-    local backup_name=$(basename "$backup_dir")
-
-    echo ""
-    warning "⚠️  ADVERTENCIA ⚠️"
-    warning "Esto SOBRESCRIBIRÁ los datos actuales con el backup: $backup_name"
-    echo ""
-    read -rp "¿Estás seguro? Escribe 'RESTAURAR' para continuar: " confirmation
-
-    if [[ "$confirmation" != "RESTAURAR" ]]; then
-        info "Restauración cancelada"
-        exit 0
-    fi
-}
-
-# Restaurar bases de datos
-restore_databases() {
-    local backup_dir="$1"
-    local db_dir="${backup_dir}/databases"
-
-    log "Restaurando bases de datos..."
-    echo ""
-
-    for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local db_name="wp_sitio${site_num}"
-        local backup_file="${db_dir}/${db_name}.sql.gz"
-
-        if [[ ! -f "$backup_file" ]]; then
-            warning "  ⚠ Backup no encontrado: $db_name"
-            continue
-        fi
-
-        info "  → Restaurando: $db_name"
-
-        # Eliminar base de datos existente
-        docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
-            -e "DROP DATABASE IF EXISTS $db_name;" 2>/dev/null || true
-
-        # Crear base de datos
-        docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
-            -e "CREATE DATABASE $db_name CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || {
-            warning "    ⚠ Error al crear $db_name"
-            continue
-        }
-
-        # Restaurar datos
-        gunzip < "$backup_file" | docker compose exec -T mysql mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "$db_name" || {
-            warning "    ⚠ Error al restaurar $db_name"
-            continue
-        }
-
-        success "    ✓ $db_name restaurado"
-    done
-
-    echo ""
-    success "✓ Bases de datos restauradas"
-}
-
-# Restaurar archivos
-restore_files() {
-    local backup_dir="$1"
-    local files_dir="${backup_dir}/files"
-
-    log "Restaurando archivos..."
-    echo ""
-
-    # Crear backup temporal de archivos actuales
-    info "  → Creando backup temporal de archivos actuales..."
-    local temp_backup="/tmp/wordpress_temp_backup_$(date +%s)"
-    mkdir -p "$temp_backup"
-    cp -r www "$temp_backup/" 2>/dev/null || true
-    success "    ✓ Backup temporal creado en: $temp_backup"
-
-    # Restaurar cada sitio
-    for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local backup_file="${files_dir}/sitio${site_num}.tar.gz"
-
-        if [[ ! -f "$backup_file" ]]; then
-            warning "  ⚠ Backup no encontrado: sitio${site_num}"
-            continue
-        fi
-
-        info "  → Restaurando: sitio${site_num}"
-
-        # Eliminar directorio actual
-        rm -rf "www/sitio${site_num}"
-
-        # Extraer backup
-        tar -xzf "$backup_file" -C www/ || {
-            warning "    ⚠ Error al restaurar sitio${site_num}"
-            continue
-        }
-
-        success "    ✓ sitio${site_num} restaurado"
-    done
-
-    # Restaurar configuraciones
-    local configs_backup="${files_dir}/configs.tar.gz"
-    if [[ -f "$configs_backup" ]]; then
-        info "  → Restaurando configuraciones..."
-        tar -xzf "$configs_backup" -C . nginx/ php/ mysql/ 2>/dev/null || true
-        success "    ✓ Configuraciones restauradas"
-    fi
-
-    echo ""
-    success "✓ Archivos restaurados"
-    info "  Backup temporal disponible en: $temp_backup"
-}
-
-# Ajustar permisos después de restaurar
-fix_permissions() {
-    log "Ajustando permisos..."
-
-    chown -R www-data:www-data www/ 2>/dev/null || chown -R 33:33 www/
-    find www/ -type d -exec chmod 755 {} \;
-    find www/ -type f -exec chmod 644 {} \;
-
-    # Configurar uploads
-    for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local uploads_dir="www/sitio${site_num}/wp-content/uploads"
-
-        if [[ -d "$uploads_dir" ]]; then
-            chmod 775 "$uploads_dir"
-            find "$uploads_dir" -type d -exec chmod 775 {} \;
-        fi
-    done
-
-    success "✓ Permisos ajustados"
-}
-
-# Reiniciar contenedores
-restart_containers() {
-    log "Reiniciando contenedores..."
-
-    docker compose restart php nginx || warning "Error al reiniciar contenedores"
-
-    success "✓ Contenedores reiniciados"
-}
-
-# Mostrar resumen
-show_summary() {
-    local backup_dir="$1"
-
-    echo ""
-    log "═══════════════════════════════════════════════════════════════"
-    log "RESTAURACIÓN COMPLETADA"
-    log "═══════════════════════════════════════════════════════════════"
-    echo ""
-
-    success "Backup restaurado desde: $(basename "$backup_dir")"
-    echo ""
-
-    info "Sitios restaurados:"
-    for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        echo "  ✓ sitio${site_num}: http://${DOMAINS[$i]}"
-    done
-    echo ""
-
-    info "Siguiente paso:"
-    echo "  Verifica que los sitios funcionen correctamente"
-    echo "  Si algo salió mal, los archivos originales están en:"
-    echo "  /tmp/wordpress_temp_backup_*"
-    echo ""
-}
-
-# Main
-main() {
-    log "🔄 Iniciando restauración de backup..."
-
-    check_requirements
-    load_env
-    list_backups
-
-    local backup_dir
-    backup_dir=$(select_backup)
-
-    confirm_restore "$backup_dir"
-
-    echo ""
-    restore_databases "$backup_dir"
-    restore_files "$backup_dir"
-    fix_permissions
-    restart_containers
-    show_summary "$backup_dir"
-
-    success "✓ Restauración completada exitosamente"
+  restart_services
+  log "✅ Proceso de restauración finalizado"
+  info "Verifica que los sitios funcionen correctamente"
 }
 
 main "$@"

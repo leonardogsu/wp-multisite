@@ -1,5 +1,10 @@
 #!/bin/bash
-# backup.sh — robusto frente a nombre de contenedor MySQL (Compose o custom)
+################################################################################
+# backup.sh - Script de backup robusto para WordPress Multi-Site
+# Compatible con estructura basada en dominios sanitizados
+# Versión: 2.0 - Actualizado para auto-install.sh
+################################################################################
+
 set -euo pipefail
 
 # --- Paths / constantes ---
@@ -16,6 +21,14 @@ log(){ echo -e "${GREEN}[$(date +'%F %T')]${NC} $*"; }
 info(){ echo -e "${BLUE}[INFO]${NC} $*"; }
 warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
 die(){ echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
+# --- Función para sanitizar nombres de dominio (igual que en setup.sh) ---
+sanitize_domain_name() {
+    local domain="$1"
+    # Convertir puntos y guiones en guiones bajos, eliminar caracteres especiales
+    # Mantiene la estructura completa del subdominio
+    echo "$domain" | sed 's/\./_/g' | sed 's/-/_/g' | sed 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
+}
 
 # --- docker compose shim ---
 compose_cmd(){
@@ -65,9 +78,15 @@ check_requirements(){
 
   # Rellenar DOMAINS si existen DOMAIN_*
   mapfile -t DOMAINS < <(grep -E '^DOMAIN_' "$ENV_FILE" | cut -d'=' -f2 || true)
+
+  if ((${#DOMAINS[@]} == 0)); then
+    warn "No hay dominios configurados (DOMAIN_*) en .env"
+  fi
+
   : "${MYSQL_ROOT_PASSWORD:?Falta MYSQL_ROOT_PASSWORD en .env}"
 
-  detect_mysql_container || die "No se encontró el contenedor de MySQL (revise nombre/servicio)."
+  detect_mysql_container || die "No se encontró el contenedor de MySQL"
+
   if [[ "$(docker inspect -f '{{.State.Running}}' "$MYSQL_CID")" != "true" ]]; then
     die "MySQL no está en ejecución (contenedor: $MYSQL_CID)"
   fi
@@ -80,6 +99,7 @@ wait_for_mysql(){
     ((tries--)) || die "MySQL no respondió a tiempo"
     sleep 2
   done
+  log "✓ MySQL está listo"
 }
 
 create_backup_dir(){
@@ -90,28 +110,36 @@ create_backup_dir(){
 
 backup_databases(){
   local dir="$1"
-  log "Dump de bases de datos..."
+  log "📦 Creando dump de bases de datos..."
+  echo ""
 
-  # Si no hay DOMAIN_* en .env, saltar dump por sitio y hacer solo global
-  if ((${#DOMAINS[@]}==0)); then
-    warn "No hay DOMAIN_* en .env; se hará solo dump global."
+  if ((${#DOMAINS[@]} == 0)); then
+    warn "No hay sitios configurados, solo se hará dump global"
   else
+    # Backup de cada base de datos individual
     for i in "${!DOMAINS[@]}"; do
-      local n; n=$((i+1))
-      local db="wp_sitio${n}"
-      local out="${dir}/databases/${db}.sql.gz"
-      info "  → ${db}"
+      local domain="${DOMAINS[$i]}"
+      local domain_sanitized=$(sanitize_domain_name "$domain")
+      local db_name="${domain_sanitized}"
+      local out="${dir}/databases/${db_name}.sql.gz"
+
+      info "  → ${domain} (DB: ${db_name})"
+
       if docker exec -i "$MYSQL_CID" mysqldump \
             -uroot -p"${MYSQL_ROOT_PASSWORD}" \
             --single-transaction --quick --lock-tables=false \
             --routines --events --triggers \
-            "${db}" | gzip > "${out}"; then
-        :
+            "${db_name}" 2>/dev/null | gzip > "${out}"; then
+        local size=$(du -h "${out}" | cut -f1)
+        log "    ✓ Backup creado (${size})"
       else
-        warn "    Falló el dump de ${db}"
+        warn "    ⚠ Falló el dump de ${db_name}"
       fi
     done
   fi
+
+  echo ""
+  info "  → Creando dump global (usuarios y privilegios)..."
 
   # Dump global (usuarios/privilegios)
   docker exec -i "$MYSQL_CID" mysqldump \
@@ -119,55 +147,168 @@ backup_databases(){
        --all-databases --single-transaction --quick --lock-tables=false \
        --routines --events --triggers \
        | gzip > "${dir}/databases/ALL_DATABASES.sql.gz"
+
+  local size=$(du -h "${dir}/databases/ALL_DATABASES.sql.gz" | cut -f1)
+  log "    ✓ Dump global creado (${size})"
+  echo ""
+  log "✅ Bases de datos respaldadas"
 }
 
 backup_files(){
   local dir="$1"
-  log "Backup de archivos de WordPress..."
-  local CZ="gzip"; command -v pigz &>/dev/null && CZ="pigz"
+  log "📁 Creando backup de archivos WordPress..."
+  echo ""
 
-  if ((${#DOMAINS[@]}==0)); then
-    warn "No hay sitios (DOMAIN_*); se omite empaquetado por sitio."
+  # Detectar si pigz está disponible para compresión paralela
+  local CZ="gzip"
+  if command -v pigz &>/dev/null; then
+    CZ="pigz"
+    info "  ℹ Usando pigz para compresión paralela"
+  fi
+
+  if ((${#DOMAINS[@]} == 0)); then
+    warn "No hay sitios configurados, se omite empaquetado por sitio"
   else
+    # Backup de cada sitio
     for i in "${!DOMAINS[@]}"; do
-      local n; n=$((i+1))
-      local site="sitio${n}"
-      local out="${dir}/files/${site}.tar.gz"
-      tar -C "${PROJECT_DIR}/www" \
-          --exclude="${site}/wp-content/cache" \
-          --exclude="${site}/wp-content/upgrade" \
-          --exclude="${site}/wp-content/backups" \
-          -cf - "${site}" 2>/dev/null | ${CZ} > "${out}" || warn "Falló ${site}"
+      local domain="${DOMAINS[$i]}"
+      local domain_sanitized=$(sanitize_domain_name "$domain")
+      local site_dir="${domain_sanitized}"
+      local out="${dir}/files/${site_dir}.tar.gz"
+
+      if [[ ! -d "${PROJECT_DIR}/www/${site_dir}" ]]; then
+        warn "  ⚠ No existe directorio: www/${site_dir}"
+        continue
+      fi
+
+      info "  → ${domain} (${site_dir})"
+
+      if tar -C "${PROJECT_DIR}/www" \
+          --exclude="${site_dir}/wp-content/cache" \
+          --exclude="${site_dir}/wp-content/upgrade" \
+          --exclude="${site_dir}/wp-content/backups" \
+          -cf - "${site_dir}" 2>/dev/null | ${CZ} > "${out}"; then
+        local size=$(du -h "${out}" | cut -f1)
+        log "    ✓ Archivos empaquetados (${size})"
+      else
+        warn "    ⚠ Falló empaquetado de ${site_dir}"
+      fi
     done
   fi
 
+  echo ""
+  info "  → Respaldando configuraciones del proyecto..."
+
+  # Backup de configuraciones
   local conf="${dir}/files/configs.tar.gz"
-  tar -C "${PROJECT_DIR}" \
+  if tar -C "${PROJECT_DIR}" \
       --exclude="mysql/data" \
       --exclude="logs" \
       -cf - ".env" "docker-compose.yml" "nginx" "php" "mysql" \
-      2>/dev/null | ${CZ} > "${conf}" || true
+      2>/dev/null | ${CZ} > "${conf}"; then
+    local size=$(du -h "${conf}" | cut -f1)
+    log "    ✓ Configuraciones respaldadas (${size})"
+  else
+    warn "    ⚠ Falló backup de configuraciones"
+  fi
+
+  echo ""
+  log "✅ Archivos respaldados"
 }
 
 cleanup_old_backups(){
-  find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +${RETENTION_DAYS} -exec rm -rf {} \; 2>/dev/null || true
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    return 0
+  fi
+
+  local old_backups=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +${RETENTION_DAYS} 2>/dev/null || true)
+
+  if [[ -n "$old_backups" ]]; then
+    echo ""
+    log "🗑️  Limpiando backups antiguos (>${RETENTION_DAYS} días)..."
+    echo "$old_backups" | while IFS= read -r old_backup; do
+      local name=$(basename "$old_backup")
+      info "  → Eliminando: $name"
+      rm -rf "$old_backup"
+    done
+    log "✅ Limpieza completada"
+  fi
 }
 
-summary(){
+show_summary(){
   local dir="$1"
-  echo -e "\n${BLUE}Backup en:${NC} $dir"
-  du -sh "$dir" 2>/dev/null | awk '{print "Tamaño total: "$1}'
+
+  echo ""
+  echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}  BACKUP COMPLETADO EXITOSAMENTE${NC}"
+  echo -e "${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+
+  info "Ubicación del backup:"
+  echo "  $dir"
+  echo ""
+
+  info "Contenido del backup:"
+
+  # Mostrar bases de datos respaldadas
+  echo ""
+  echo "  📦 Bases de datos:"
+  if [[ -d "${dir}/databases" ]]; then
+    for db_file in "${dir}/databases"/*.sql.gz; do
+      if [[ -f "$db_file" ]]; then
+        local name=$(basename "$db_file" .sql.gz)
+        local size=$(du -h "$db_file" | cut -f1)
+        echo "     • ${name} (${size})"
+      fi
+    done
+  fi
+
+  # Mostrar archivos respaldados
+  echo ""
+  echo "  📁 Archivos:"
+  if [[ -d "${dir}/files" ]]; then
+    for file_archive in "${dir}/files"/*.tar.gz; do
+      if [[ -f "$file_archive" ]]; then
+        local name=$(basename "$file_archive" .tar.gz)
+        local size=$(du -h "$file_archive" | cut -f1)
+        echo "     • ${name} (${size})"
+      fi
+    done
+  fi
+
+  echo ""
+  info "Tamaño total:"
+  local total_size=$(du -sh "$dir" 2>/dev/null | awk '{print $1}')
+  echo "  ${total_size}"
+
+  echo ""
+  info "Retención de backups: ${RETENTION_DAYS} días"
+
+  local backup_count=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  echo "  Backups totales disponibles: ${backup_count}"
+
+  echo ""
+  echo -e "${GREEN}✓${NC} Para restaurar este backup, ejecuta:"
+  echo "  ./scripts/restore.sh --backup $dir"
+  echo ""
 }
 
 main(){
-  log "🔄 Iniciando backup..."
+  log "🚀 Iniciando proceso de backup..."
+  echo ""
+
   check_requirements
   wait_for_mysql
-  local dir; dir="$(create_backup_dir)"
+
+  local dir
+  dir="$(create_backup_dir)"
+
   backup_databases "$dir"
   backup_files "$dir"
   cleanup_old_backups
-  summary "$dir"
-  echo -e "${GREEN}[OK]${NC} Backup completado"
+  show_summary "$dir"
+
+  echo -e "${GREEN}✅ Proceso de backup completado${NC}"
 }
+
 main "$@"
