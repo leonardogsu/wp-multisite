@@ -452,6 +452,14 @@ restore_from_external_zip(){
   # Archivos
   info "Sobrescribiendo archivos del sitio ${domain_sanitized}..."
 
+  # Guardar wp-config.php actual antes de hacer backup del sitio
+  local OLD_WPCONFIG=""
+  if [[ -f "${site_dir}/wp-config.php" ]]; then
+    OLD_WPCONFIG="$(mktemp)"
+    cp "${site_dir}/wp-config.php" "$OLD_WPCONFIG"
+    info "  wp-config.php actual guardado temporalmente"
+  fi
+
   # Backup temporal del sitio actual
   if [[ -d "$site_dir" ]]; then
     local backup_name="${domain_sanitized}.bak.$(date +%Y%m%d_%H%M%S)"
@@ -473,6 +481,12 @@ restore_from_external_zip(){
 
   mv "$inner_dir"/* "$site_dir/"
   mv "$inner_dir"/.[!.]* "$site_dir/" 2>/dev/null || true
+
+  # Preservar credenciales del wp-config.php antiguo
+  if [[ -n "$OLD_WPCONFIG" && -f "$OLD_WPCONFIG" ]]; then
+    preserve_wpconfig_credentials "$OLD_WPCONFIG" "${site_dir}/wp-config.php"
+    rm -f "$OLD_WPCONFIG"
+  fi
 
   # Permisos
   chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
@@ -561,6 +575,62 @@ _extract_tar_autodetect(){
     *.tar)           tar -xf  "$tarfile" -C "$dest" ;;
     *) die "Formato TAR no soportado: $(basename "$tarfile")" ;;
   esac
+}
+
+# Preserva configuraciones de DB y SFTP del wp-config.php antiguo en el nuevo
+preserve_wpconfig_credentials(){
+  local old_config="$1"
+  local new_config="$2"
+
+  [[ -f "$old_config" ]] || { warn "No se encontró wp-config.php antiguo, usando el del backup"; return; }
+  [[ -f "$new_config" ]] || { warn "No se encontró wp-config.php nuevo"; return; }
+
+  info "Preservando credenciales de DB y SFTP del wp-config.php actual..."
+
+  # Crear archivo temporal con las definiciones a preservar
+  local TMP_DEFS; TMP_DEFS="$(mktemp)"
+
+  # Extraer definiciones de base de datos
+  grep -E "^define\(\s*['\"]DB_(NAME|USER|PASSWORD|HOST|CHARSET|COLLATE)['\"]" "$old_config" > "$TMP_DEFS" || true
+
+  # Extraer definiciones de SFTP/FTP
+  grep -E "^define\(\s*['\"]FTP_(USER|PASS|HOST|SSL|PUBKEY|PRIKEY)['\"]" "$old_config" >> "$TMP_DEFS" || true
+  grep -E "^define\(\s*['\"]FS_METHOD['\"]" "$old_config" >> "$TMP_DEFS" || true
+
+  # Extraer definiciones adicionales de FTP
+  grep -E "^define\(\s*['\"]FTPS?_(USER|PASS|HOST|SSL|PORT)['\"]" "$old_config" >> "$TMP_DEFS" || true
+
+  if [[ ! -s "$TMP_DEFS" ]]; then
+    warn "No se encontraron definiciones de DB o SFTP para preservar"
+    rm -f "$TMP_DEFS"
+    return
+  fi
+
+  # Crear backup del nuevo config antes de modificar
+  cp "$new_config" "${new_config}.bak"
+
+  # Eliminar las definiciones antiguas del nuevo archivo
+  sed -i '/^define(\s*['\''"]DB_\(NAME\|USER\|PASSWORD\|HOST\|CHARSET\|COLLATE\)['\''"].*$/d' "$new_config"
+  sed -i '/^define(\s*['\''"]FTP_\(USER\|PASS\|HOST\|SSL\|PUBKEY\|PRIKEY\)['\''"].*$/d' "$new_config"
+  sed -i '/^define(\s*['\''"]FTPS\?_\(USER\|PASS\|HOST\|SSL\|PORT\)['\''"].*$/d' "$new_config"
+  sed -i '/^define(\s*['\''"]FS_METHOD['\''"].*$/d' "$new_config"
+
+  # Insertar las definiciones preservadas después de la línea de configuración de MySQL
+  # Buscar la última línea que contiene comentarios sobre MySQL o DB
+  local insert_line
+  insert_line=$(grep -n "\/\*\*.*MySQL\|\/\*\*.*database\|\/\/ \*\* MySQL" "$new_config" | tail -1 | cut -d: -f1 || echo "")
+
+  if [[ -n "$insert_line" ]]; then
+    # Insertar después del comentario
+    sed -i "${insert_line}r $TMP_DEFS" "$new_config"
+  else
+    # Si no hay comentario, insertar al principio después de la etiqueta PHP
+    sed -i "1r $TMP_DEFS" "$new_config"
+  fi
+
+  rm -f "$TMP_DEFS"
+
+  log "✓ Credenciales de DB y SFTP preservadas en wp-config.php"
 }
 
 restart_services(){

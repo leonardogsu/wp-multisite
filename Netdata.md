@@ -20,17 +20,17 @@ Una forma **súper segura** de ver Netdata en tu navegador, cifrando toda la con
 
 #### En Linux/Mac:
 ```bash
-ssh -L 19999:localhost:19999 root@TU_IP_SERVIDOR
+ssh -L 19999:localhost:19999 root@146.59.228.174
 ```
 
 #### En Windows (PowerShell):
 ```powershell
-ssh -L 19999:localhost:19999 root@TU_IP_SERVIDOR
+ssh -L 19999:localhost:19999 root@146.59.228.174
 ```
 
 **Reemplaza:** `TU_IP_SERVIDOR` con tu IP real, ejemplo:
 ```bash
-ssh -L 19999:localhost:19999 root@123.45.67.89
+ssh -L 19999:localhost:19999 root@146.59.228.174
 ```
 
 ---
@@ -39,7 +39,7 @@ ssh -L 19999:localhost:19999 root@123.45.67.89
 
 Te pedirá tu contraseña SSH (o clave privada):
 ```
-root@123.45.67.89's password: _
+root@146.59.228.174's password: _
 ```
 
 Introduce tu contraseña y presiona Enter.
