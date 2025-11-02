@@ -2,7 +2,7 @@
 ################################################################################
 # restore.sh - Script de restauración para WordPress Multi-Site
 # Compatible con estructura basada en dominios sanitizados
-# Versión: 2.0 - Actualizado para auto-install.sh
+# Versión: 2.2 - Restauración externa mediante opción --external
 #
 # Uso:
 #   ./scripts/restore.sh --all                    # Restaura todos los sitios
@@ -10,7 +10,15 @@
 #   ./scripts/restore.sh --site 2                 # Restaura sitio por índice
 #   ./scripts/restore.sh --backup DIR             # Usa un backup específico
 #   ./scripts/restore.sh --all --yes              # Sin confirmación
+#
+#   --- Restauración externa ---
+#   ./scripts/restore.sh --external               # Restaurar desde ZIP externo
+#       - Lista los ZIPs disponibles en backups/external
+#       - Permite elegir un ZIP que contenga un SQL y un TAR
+#       - Permite elegir un sitio destino instalado
+#       - Sobrescribe la base de datos y los archivos de ese sitio
 ################################################################################
+
 
 set -euo pipefail
 
@@ -89,14 +97,20 @@ while [[ $# -gt 0 ]]; do
     --all) MODE="all"; shift ;;
     --site) MODE="one"; SITE_ARG="${2:-}"; [[ -n "${SITE_ARG}" ]] || die "Falta valor para --site"; shift 2 ;;
     --backup) BACKUP_DIR="${2:-}"; [[ -n "${BACKUP_DIR}" ]] || die "Falta ruta para --backup"; shift 2 ;;
+    --external) MODE="external"; shift ;;
     --yes|-y) ASSUME_YES="yes"; shift ;;
     -h|--help)
-      sed -n '1,15p' "$0"; exit 0 ;;
+      sed -n '1,20p' "$0"; exit 0 ;;
     *) die "Opción no reconocida: $1 (usa --help para ayuda)" ;;
   esac
 done
 
-[[ -n "$MODE" ]] || die "Debe indicar --all o --site <dominio|índice>"
+# --- Restauración externa: ZIP que contiene un SQL y un TAR ---
+EXTERNAL_DIR="${BACKUP_ROOT}/external"
+EXTERNAL_ZIP=""
+
+
+[[ -n "$MODE" ]] || die "Debe indicar --all, --site <dominio|índice> o --external"
 
 # --- Cargar entorno / dominios ---
 load_env(){
@@ -374,6 +388,181 @@ restore_all(){
   log "✅ Restauración completa"
 }
 
+restore_from_external_zip(){
+  log "🗂 Restauración externa desde ZIP en ${EXTERNAL_DIR}"
+
+  select_external_zip
+  [[ -f "$EXTERNAL_ZIP" ]] || die "ZIP no encontrado: $EXTERNAL_ZIP"
+
+  # Descomprimir ZIP a un directorio temporal
+  local TMP; TMP="$(mktemp -d)"
+  unzip -oq "$EXTERNAL_ZIP" -d "$TMP" || die "No se pudo descomprimir el ZIP"
+
+  # Identificar SQL y TAR dentro del ZIP
+  local SQL_FILE TAR_FILE
+  SQL_FILE=$(_pick_sql_file "$TMP")
+  TAR_FILE=$(_pick_tar_file "$TMP")
+
+  info "SQL detectado: $(basename "$SQL_FILE")"
+  info "TAR detectado: $(basename "$TAR_FILE")"
+
+  # Elegir sitio destino
+  echo ""
+  info "Sitios instalados:"
+  for i in "${!DOMAINS[@]}"; do
+    echo "  $((i+1)). ${DOMAINS[$i]}"
+  done
+  echo ""
+  read -rp "Selecciona el número del sitio a sobrescribir: " selection
+  [[ "$selection" =~ ^[0-9]+$ ]] || die "Selección inválida"
+  (( selection >= 1 && selection <= ${#DOMAINS[@]} )) || die "Índice fuera de rango"
+
+  local domain="${DOMAINS[$((selection-1))]}"
+  local domain_sanitized; domain_sanitized=$(sanitize_domain_name "$domain")
+  local site_dir="${PROJECT_DIR}/www/${domain_sanitized}"
+  local db_name="${domain_sanitized}"
+
+  echo ""
+  echo -e "${BLUE}Resumen de restauración externa${NC}"
+  echo "  ZIP:      $(basename "$EXTERNAL_ZIP")"
+  echo "  SQL:      $(basename "$SQL_FILE")"
+  echo "  TAR:      $(basename "$TAR_FILE")"
+  echo "  Sitio:    #${selection} - ${domain}"
+  echo "  Carpeta:  ${domain_sanitized}"
+  echo ""
+
+  warn "⚠️  ADVERTENCIA: Se sobrescribirán TODOS los archivos y la base de datos del sitio seleccionado"
+  confirm || { info "Cancelado."; rm -rf "$TMP"; return; }
+
+  # Base de datos
+  info "Restaurando base de datos ${db_name}..."
+  docker exec "$MYSQL_CID" sh -c \
+    "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" -e \"DROP DATABASE IF EXISTS \\\`${db_name}\\\`; CREATE DATABASE \\\`${db_name}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" \
+    || { rm -rf "$TMP"; die "Error al recrear la base de datos"; }
+
+  if [[ "$SQL_FILE" == *.sql.gz ]]; then
+    zcat "$SQL_FILE" | docker exec -i "$MYSQL_CID" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "${db_name}" \
+      || { rm -rf "$TMP"; die "Error al importar el SQL gz"; }
+  else
+    cat "$SQL_FILE" | docker exec -i "$MYSQL_CID" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" "${db_name}" \
+      || { rm -rf "$TMP"; die "Error al importar el SQL"; }
+  fi
+  log "✓ Base de datos restaurada"
+
+  # Archivos
+  info "Sobrescribiendo archivos del sitio ${domain_sanitized}..."
+
+  # Backup temporal del sitio actual
+  if [[ -d "$site_dir" ]]; then
+    local backup_name="${domain_sanitized}.bak.$(date +%Y%m%d_%H%M%S)"
+    mv "$site_dir" "${PROJECT_DIR}/www/${backup_name}"
+    info "  Backup temporal del sitio actual: www/${backup_name}"
+  fi
+
+  mkdir -p "$site_dir"
+
+  # Extraer TAR a un staging temporal y mover el directorio raíz al destino
+  local STAGE="$TMP/_wpfiles"
+  mkdir -p "$STAGE"
+  _extract_tar_autodetect "$TAR_FILE" "$STAGE"
+
+  # Detectar directorio raíz extraído
+  local inner_dir
+  inner_dir="$(find "$STAGE" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "$inner_dir" ]] || { rm -rf "$TMP"; die "No se detectó carpeta raíz dentro del TAR"; }
+
+  mv "$inner_dir"/* "$site_dir/"
+  mv "$inner_dir"/.[!.]* "$site_dir/" 2>/dev/null || true
+
+  # Permisos
+  chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
+  find "$site_dir" -type d -exec chmod 755 {} \;
+  find "$site_dir" -type f -exec chmod 644 {} \;
+  if [[ -d "$site_dir/wp-content/uploads" ]]; then
+    chmod 775 "$site_dir/wp-content/uploads"
+    find "$site_dir/wp-content/uploads" -type d -exec chmod 775 {} \;
+  fi
+  log "✓ Archivos restaurados en www/${domain_sanitized}"
+
+  # Limpieza
+  rm -rf "$TMP"
+
+  log "✅ Restauración externa completada para ${domain}"
+}
+
+
+select_external_zip(){
+  [[ -d "$EXTERNAL_DIR" ]] || die "No existe ${EXTERNAL_DIR}"
+
+  mapfile -t zips < <(find "$EXTERNAL_DIR" -maxdepth 1 -type f -name "*.zip" -printf "%T@ %p\n" 2>/dev/null | sort -rn | cut -d' ' -f2- || true)
+
+  if (( ${#zips[@]} == 0 )); then
+    die "No hay archivos .zip en ${EXTERNAL_DIR}"
+  fi
+
+  echo ""
+  info "ZIPs disponibles en ${EXTERNAL_DIR}:"
+  echo ""
+
+  for i in "${!zips[@]}"; do
+    local idx=$((i+1))
+    local zip_name=$(basename "${zips[$i]}")
+    local zip_size=$(du -h "${zips[$i]}" 2>/dev/null | awk '{print $1}')
+    local zip_date=$(stat -c %y "${zips[$i]}" 2>/dev/null | cut -d' ' -f1 || echo "")
+
+    if [[ $i -eq 0 ]]; then
+      echo -e "  ${GREEN}${idx}. ${zip_name}${NC} (${zip_size}) [${zip_date}] ${BLUE}← Más reciente${NC}"
+    else
+      echo "  ${idx}. ${zip_name} (${zip_size}) [${zip_date}]"
+    fi
+  done
+  echo ""
+
+  if [[ "$ASSUME_YES" == "yes" && ${#zips[@]} -eq 1 ]]; then
+    EXTERNAL_ZIP="${zips[0]}"
+    info "Usando ZIP: $(basename "$EXTERNAL_ZIP")"
+  else
+    read -rp "Selecciona el número del ZIP a usar [1 = más reciente]: " sel
+    sel="${sel:-1}"
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#zips[@]} )); then
+      die "Selección inválida"
+    fi
+    EXTERNAL_ZIP="${zips[$((sel-1))]}"
+    info "ZIP seleccionado: $(basename "$EXTERNAL_ZIP")"
+  fi
+}
+
+# Devuelve por stdout la ruta al SQL extraído. Soporta .sql y .sql.gz
+_pick_sql_file(){
+  local root="$1"
+  local f
+  f=$(find "$root" -type f \( -iname "*.sql" -o -iname "*.sql.gz" \) | head -n1 || true)
+  [[ -n "$f" ]] || die "No se encontró archivo SQL dentro del ZIP"
+  echo "$f"
+}
+
+# Devuelve por stdout la ruta al TAR extraído. Soporta .tar .tar.gz .tgz .tar.bz2
+_pick_tar_file(){
+  local root="$1"
+  local f
+  f=$(find "$root" -type f \( -iname "*.tar" -o -iname "*.tar.gz" -o -iname "*.tgz" -o -iname "*.tar.bz2" \) | head -n1 || true)
+  [[ -n "$f" ]] || die "No se encontró archivo TAR dentro del ZIP"
+  echo "$f"
+}
+
+# Extrae TAR a un destino. Auto detecta compresión
+_extract_tar_autodetect(){
+  local tarfile="$1"
+  local dest="$2"
+  mkdir -p "$dest"
+  case "$tarfile" in
+    *.tar.gz|*.tgz)  tar -xzf "$tarfile" -C "$dest" ;;
+    *.tar.bz2)       tar -xjf "$tarfile" -C "$dest" ;;
+    *.tar)           tar -xf  "$tarfile" -C "$dest" ;;
+    *) die "Formato TAR no soportado: $(basename "$tarfile")" ;;
+  esac
+}
+
 restart_services(){
   info "Reiniciando servicios PHP y Nginx..."
   local DC; DC="$(compose_cmd)"
@@ -387,6 +576,16 @@ main(){
   load_env
   detect_mysql_container || die "No se encontró contenedor MySQL"
   wait_for_mysql
+
+  # Modo de restauración externa (solo si se especifica --external)
+  if [[ "$MODE" == "external" ]]; then
+    restore_from_external_zip
+    restart_services
+    log "✅ Restauración externa finalizada"
+    exit 0
+  fi
+
+  # Restauración normal desde backups locales
   resolve_backup_dir
 
   local format=$(detect_backup_format)
