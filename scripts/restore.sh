@@ -2,7 +2,7 @@
 ################################################################################
 # restore.sh - Script de restauración para WordPress Multi-Site
 # Compatible con estructura basada en dominios sanitizados
-# Versión: 2.2 - Restauración externa mediante opción --external
+# Versión: 2.3 - Permisos mejorados para WordPress
 #
 # Uso:
 #   ./scripts/restore.sh --all                    # Restaura todos los sitios
@@ -17,6 +17,12 @@
 #       - Permite elegir un ZIP que contenga un SQL y un TAR
 #       - Permite elegir un sitio destino instalado
 #       - Sobrescribe la base de datos y los archivos de ese sitio
+#
+# Changelog v2.3:
+#   - Permisos completos de WordPress establecidos correctamente en todos los modos
+#   - Soluciona problemas de permisos para subir medios y actualizar plugins/temas
+#   - Crea automáticamente el directorio wp-content/upgrade si no existe
+#   - Permisos mejorados en wp-content, plugins, themes, uploads, upgrade y cache
 ################################################################################
 
 
@@ -39,6 +45,67 @@ die(){ echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 sanitize_domain_name() {
     local domain="$1"
     echo "$domain" | sed 's/\./_/g' | sed 's/-/_/g' | sed 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
+}
+
+# --- Función para establecer permisos correctos de WordPress ---
+set_wordpress_permissions() {
+    local site_dir="$1"
+
+    [[ -d "$site_dir" ]] || { warn "Directorio no existe: $site_dir"; return 1; }
+
+    info "Estableciendo permisos de WordPress..."
+
+    # Permisos base: propietario www-data
+    chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
+
+    # Directorios: 755, Archivos: 644
+    find "$site_dir" -type d -exec chmod 755 {} \;
+    find "$site_dir" -type f -exec chmod 644 {} \;
+
+    # wp-content/uploads: necesita escritura para subir medios
+    if [[ -d "$site_dir/wp-content/uploads" ]]; then
+        chmod 775 "$site_dir/wp-content/uploads"
+        find "$site_dir/wp-content/uploads" -type d -exec chmod 775 {} \;
+        find "$site_dir/wp-content/uploads" -type f -exec chmod 664 {} \;
+    fi
+
+    # wp-content/plugins: necesita escritura para actualizar plugins
+    if [[ -d "$site_dir/wp-content/plugins" ]]; then
+        chmod 775 "$site_dir/wp-content/plugins"
+        find "$site_dir/wp-content/plugins" -type d -exec chmod 775 {} \;
+    fi
+
+    # wp-content/themes: necesita escritura para actualizar temas
+    if [[ -d "$site_dir/wp-content/themes" ]]; then
+        chmod 775 "$site_dir/wp-content/themes"
+        find "$site_dir/wp-content/themes" -type d -exec chmod 775 {} \;
+    fi
+
+    # wp-content/upgrade: necesita escritura para actualizaciones temporales
+    if [[ -d "$site_dir/wp-content/upgrade" ]]; then
+        chmod 775 "$site_dir/wp-content/upgrade"
+        find "$site_dir/wp-content/upgrade" -type d -exec chmod 775 {} \;
+    else
+        # Crear directorio upgrade si no existe
+        mkdir -p "$site_dir/wp-content/upgrade"
+        chown www-data:www-data "$site_dir/wp-content/upgrade" 2>/dev/null || chown 33:33 "$site_dir/wp-content/upgrade"
+        chmod 775 "$site_dir/wp-content/upgrade"
+    fi
+
+    # wp-content/cache: si existe, necesita escritura
+    if [[ -d "$site_dir/wp-content/cache" ]]; then
+        chmod 775 "$site_dir/wp-content/cache"
+        find "$site_dir/wp-content/cache" -type d -exec chmod 775 {} \;
+        find "$site_dir/wp-content/cache" -type f -exec chmod 664 {} \;
+    fi
+
+    # wp-content base: debe permitir crear subcarpetas
+    if [[ -d "$site_dir/wp-content" ]]; then
+        chmod 775 "$site_dir/wp-content"
+    fi
+
+    log "✓ Permisos de WordPress establecidos correctamente"
+    return 0
 }
 
 # --- docker compose shim ---
@@ -354,13 +421,7 @@ restore_files(){
 
   # 🛠 Ajustar permisos solo si el directorio existe tras extraer
   if [[ -d "$site_dir" ]]; then
-    chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
-    find "$site_dir" -type d -exec chmod 755 {} \;
-    find "$site_dir" -type f -exec chmod 644 {} \;
-    if [[ -d "$site_dir/wp-content/uploads" ]]; then
-      chmod 775 "$site_dir/wp-content/uploads"
-      find "$site_dir/wp-content/uploads" -type d -exec chmod 775 {} \;
-    fi
+    set_wordpress_permissions "$site_dir"
     log "  ✓ Archivos restaurados en www/${domain_sanitized}"
   else
     die "❌ No se encontró ${site_dir} tras la extracción. Estructura inesperada en el backup."
@@ -488,14 +549,8 @@ restore_from_external_zip(){
     rm -f "$OLD_WPCONFIG"
   fi
 
-  # Permisos
-  chown -R www-data:www-data "$site_dir" 2>/dev/null || chown -R 33:33 "$site_dir"
-  find "$site_dir" -type d -exec chmod 755 {} \;
-  find "$site_dir" -type f -exec chmod 644 {} \;
-  if [[ -d "$site_dir/wp-content/uploads" ]]; then
-    chmod 775 "$site_dir/wp-content/uploads"
-    find "$site_dir/wp-content/uploads" -type d -exec chmod 775 {} \;
-  fi
+  # Permisos completos de WordPress
+  set_wordpress_permissions "$site_dir"
   log "✓ Archivos restaurados en www/${domain_sanitized}"
 
   # Limpieza
