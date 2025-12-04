@@ -2,7 +2,7 @@
 
 ################################################################################
 # Script de gestión de certificados SSL con Let's Encrypt
-# Versión mejorada - siempre verifica y corrige estructura de archivos
+# Versión mejorada con selección interactiva de dominios
 ################################################################################
 
 set -e
@@ -12,6 +12,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 log() {
@@ -35,6 +37,10 @@ success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
+header() {
+    echo -e "${CYAN}${BOLD}$1${NC}"
+}
+
 # Cargar variables
 if [ ! -f .env ]; then
     error "Archivo .env no encontrado"
@@ -42,6 +48,265 @@ fi
 
 source .env
 
+################################################################################
+# FUNCIÓN: Detectar dominios disponibles
+################################################################################
+
+detect_domains() {
+    local -n domains_ref=$1
+    local -n sources_ref=$2
+
+    # Array para evitar duplicados
+    declare -A seen_domains
+
+    # 1. Buscar dominios en .env (DOMAIN_1, DOMAIN_2, etc.)
+    while IFS='=' read -r key value; do
+        if [[ "$key" =~ ^DOMAIN_[0-9]+$ ]]; then
+            domain=$(echo "$value" | tr -d '"' | tr -d "'")
+            if [[ -n "$domain" && -z "${seen_domains[$domain]}" ]]; then
+                domains_ref+=("$domain")
+                sources_ref["$domain"]="env"
+                seen_domains["$domain"]=1
+            fi
+        fi
+    done < .env
+
+    # 2. Buscar dominios en configuraciones de Nginx
+    if [ -d "nginx/conf.d" ]; then
+        for conf_file in nginx/conf.d/*.conf; do
+            if [ -f "$conf_file" ]; then
+                # Extraer server_name de las configuraciones
+                while read -r line; do
+                    # Limpiar y extraer dominio
+                    domain=$(echo "$line" | sed 's/server_name//g' | sed 's/;//g' | tr -d ' ' | head -1)
+                    # Ignorar www. y localhost
+                    if [[ -n "$domain" && "$domain" != "www."* && "$domain" != "localhost" && -z "${seen_domains[$domain]}" ]]; then
+                        domains_ref+=("$domain")
+                        sources_ref["$domain"]="nginx"
+                        seen_domains["$domain"]=1
+                    fi
+                done < <(grep "server_name" "$conf_file" | grep -v "www\." | head -1)
+            fi
+        done
+    fi
+
+    # 3. Buscar certificados existentes en certbot
+    if [ -d "certbot/conf/live" ]; then
+        for cert_dir in certbot/conf/live/*/; do
+            if [ -d "$cert_dir" ]; then
+                domain=$(basename "$cert_dir")
+                if [[ -n "$domain" && "$domain" != "README" && -z "${seen_domains[$domain]}" ]]; then
+                    domains_ref+=("$domain")
+                    sources_ref["$domain"]="certbot"
+                    seen_domains["$domain"]=1
+                fi
+            fi
+        done
+    fi
+}
+
+################################################################################
+# FUNCIÓN: Mostrar estado de certificado de un dominio
+################################################################################
+
+get_cert_status() {
+    local domain=$1
+
+    if [ -d "certbot/conf/live/$domain" ] && [ -f "certbot/conf/live/$domain/fullchain.pem" ]; then
+        EXPIRY=$(openssl x509 -enddate -noout -in "certbot/conf/live/$domain/cert.pem" 2>/dev/null | cut -d= -f2 || echo "")
+
+        if [ -n "$EXPIRY" ]; then
+            EXPIRY_TIMESTAMP=$(date -d "$EXPIRY" +%s 2>/dev/null || echo "0")
+            CURRENT_TIMESTAMP=$(date +%s)
+            DAYS_LEFT=$(( ($EXPIRY_TIMESTAMP - $CURRENT_TIMESTAMP) / 86400 ))
+
+            if [ $DAYS_LEFT -lt 0 ]; then
+                echo "EXPIRADO"
+            elif [ $DAYS_LEFT -lt 30 ]; then
+                echo "EXPIRA EN ${DAYS_LEFT}d"
+            else
+                echo "VÁLIDO (${DAYS_LEFT}d)"
+            fi
+        else
+            echo "INSTALADO"
+        fi
+    else
+        echo "SIN SSL"
+    fi
+}
+
+################################################################################
+# FUNCIÓN: Menú de selección de dominios
+################################################################################
+
+select_domains_menu() {
+    local -n available_domains=$1
+    local -n selected_domains=$2
+    local -n domain_sources=$3
+
+    while true; do
+        clear
+        echo ""
+        header "═══════════════════════════════════════════════════════════════"
+        header "           GESTIÓN DE CERTIFICADOS SSL - Let's Encrypt          "
+        header "═══════════════════════════════════════════════════════════════"
+        echo ""
+
+        info "Dominios detectados en el servidor:"
+        echo ""
+
+        printf "  ${BOLD}%-4s %-35s %-12s %-18s${NC}\n" "NUM" "DOMINIO" "ORIGEN" "ESTADO SSL"
+        echo "  ─────────────────────────────────────────────────────────────────"
+
+        for i in "${!available_domains[@]}"; do
+            domain="${available_domains[$i]}"
+            source="${domain_sources[$domain]}"
+            status=$(get_cert_status "$domain")
+            num=$((i + 1))
+
+            # Color según estado
+            case "$status" in
+                "SIN SSL")
+                    status_color="${RED}"
+                    ;;
+                "EXPIRADO")
+                    status_color="${RED}"
+                    ;;
+                "EXPIRA"*)
+                    status_color="${YELLOW}"
+                    ;;
+                *)
+                    status_color="${GREEN}"
+                    ;;
+            esac
+
+            # Marcar si está seleccionado
+            if [[ " ${selected_domains[*]} " =~ " ${domain} " ]]; then
+                printf "  ${GREEN}[✓]${NC} %-3s %-35s %-12s ${status_color}%-18s${NC}\n" "$num" "$domain" "($source)" "$status"
+            else
+                printf "  [ ] %-3s %-35s %-12s ${status_color}%-18s${NC}\n" "$num" "$domain" "($source)" "$status"
+            fi
+        done
+
+        echo ""
+        echo "  ─────────────────────────────────────────────────────────────────"
+        echo ""
+
+        if [ ${#selected_domains[@]} -gt 0 ]; then
+            success "Dominios seleccionados (${#selected_domains[@]}): ${selected_domains[*]}"
+        else
+            warning "Ningún dominio seleccionado"
+        fi
+
+        echo ""
+        header "OPCIONES:"
+        echo ""
+        echo -e "  ${BOLD}Números${NC}     - Escribe el número del dominio para seleccionar/deseleccionar"
+        echo -e "  ${BOLD}a/all${NC}       - Seleccionar TODOS los dominios"
+        echo -e "  ${BOLD}n/none${NC}      - Deseleccionar todos"
+        echo -e "  ${BOLD}sin-ssl${NC}     - Seleccionar solo dominios SIN certificado"
+        echo -e "  ${BOLD}expirados${NC}   - Seleccionar dominios expirados o por expirar (<30 días)"
+        echo -e "  ${BOLD}c/continue${NC}  - Continuar con la selección actual"
+        echo -e "  ${BOLD}q/quit${NC}      - Salir sin hacer cambios"
+        echo ""
+
+        read -p "Opción: " choice
+
+        case "$choice" in
+            [0-9]*)
+                # Selección por número
+                idx=$((choice - 1))
+                if [ $idx -ge 0 ] && [ $idx -lt ${#available_domains[@]} ]; then
+                    domain="${available_domains[$idx]}"
+
+                    # Toggle: si ya está seleccionado, quitar; si no, añadir
+                    if [[ " ${selected_domains[*]} " =~ " ${domain} " ]]; then
+                        # Remover del array
+                        selected_domains=("${selected_domains[@]/$domain}")
+                        # Limpiar elementos vacíos
+                        local temp=()
+                        for d in "${selected_domains[@]}"; do
+                            [[ -n "$d" ]] && temp+=("$d")
+                        done
+                        selected_domains=("${temp[@]}")
+                        info "Deseleccionado: $domain"
+                    else
+                        selected_domains+=("$domain")
+                        success "Seleccionado: $domain"
+                    fi
+                    sleep 0.5
+                else
+                    warning "Número inválido"
+                    sleep 1
+                fi
+                ;;
+            a|A|all|ALL|todos|TODOS)
+                selected_domains=("${available_domains[@]}")
+                success "Todos los dominios seleccionados"
+                sleep 0.5
+                ;;
+            n|N|none|NONE|ninguno|NINGUNO)
+                selected_domains=()
+                info "Selección limpiada"
+                sleep 0.5
+                ;;
+            sin-ssl|SIN-SSL|sinssl)
+                selected_domains=()
+                for domain in "${available_domains[@]}"; do
+                    status=$(get_cert_status "$domain")
+                    if [[ "$status" == "SIN SSL" ]]; then
+                        selected_domains+=("$domain")
+                    fi
+                done
+                if [ ${#selected_domains[@]} -eq 0 ]; then
+                    info "No hay dominios sin SSL"
+                else
+                    success "Seleccionados ${#selected_domains[@]} dominios sin SSL"
+                fi
+                sleep 0.5
+                ;;
+            expirados|EXPIRADOS|exp)
+                selected_domains=()
+                for domain in "${available_domains[@]}"; do
+                    status=$(get_cert_status "$domain")
+                    if [[ "$status" == "EXPIRADO" || "$status" == EXPIRA* ]]; then
+                        selected_domains+=("$domain")
+                    fi
+                done
+                if [ ${#selected_domains[@]} -eq 0 ]; then
+                    info "No hay dominios expirados o por expirar"
+                else
+                    success "Seleccionados ${#selected_domains[@]} dominios expirados/por expirar"
+                fi
+                sleep 0.5
+                ;;
+            c|C|continue|CONTINUE|continuar)
+                if [ ${#selected_domains[@]} -eq 0 ]; then
+                    warning "Debes seleccionar al menos un dominio"
+                    sleep 1
+                else
+                    return 0
+                fi
+                ;;
+            q|Q|quit|QUIT|salir|exit)
+                echo ""
+                info "Operación cancelada por el usuario"
+                exit 0
+                ;;
+            *)
+                warning "Opción no válida"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+################################################################################
+# INICIO DEL SCRIPT
+################################################################################
+
+clear
+echo ""
 log "═══════════════════════════════════════════════════"
 log "CONFIGURACIÓN DE CERTIFICADOS SSL"
 log "═══════════════════════════════════════════════════"
@@ -59,14 +324,35 @@ if grep -q "INSTALL_PHPMYADMIN=true" .env 2>/dev/null; then
     info "phpMyAdmin detectado - se configurará SSL para él también"
 fi
 
-# Obtener dominios
-DOMAINS=($(grep "^DOMAIN_" .env | cut -d'=' -f2))
+# Detectar dominios disponibles
+declare -a AVAILABLE_DOMAINS
+declare -A DOMAIN_SOURCES
 
-if [ ${#DOMAINS[@]} -eq 0 ]; then
-    error "No se encontraron dominios en .env"
+info "Detectando dominios instalados en el servidor..."
+detect_domains AVAILABLE_DOMAINS DOMAIN_SOURCES
+
+if [ ${#AVAILABLE_DOMAINS[@]} -eq 0 ]; then
+    error "No se encontraron dominios configurados en el servidor"
 fi
 
-info "Dominios a procesar: ${DOMAINS[@]}"
+success "Se encontraron ${#AVAILABLE_DOMAINS[@]} dominio(s)"
+echo ""
+
+# Mostrar menú de selección
+declare -a SELECTED_DOMAINS
+select_domains_menu AVAILABLE_DOMAINS SELECTED_DOMAINS DOMAIN_SOURCES
+
+# A partir de aquí, usamos SELECTED_DOMAINS en lugar de DOMAINS
+DOMAINS=("${SELECTED_DOMAINS[@]}")
+
+echo ""
+log "═══════════════════════════════════════════════════"
+log "DOMINIOS A PROCESAR"
+log "═══════════════════════════════════════════════════"
+echo ""
+for domain in "${DOMAINS[@]}"; do
+    echo "  • $domain"
+done
 echo ""
 
 ################################################################################
@@ -113,8 +399,8 @@ echo ""
 # Determinar si se puede saltar la generación de certificados
 SKIP_CERT_GENERATION=false
 
-if [ ${#EXISTING_CERTS[@]} -eq ${#DOMAINS[@]} ]; then
-    success "Todos los dominios (${#EXISTING_CERTS[@]}/${#DOMAINS[@]}) ya tienen certificados SSL"
+if [ ${#EXISTING_CERTS[@]} -eq ${#DOMAINS[@]} ] && [ ${#DOMAINS[@]} -gt 0 ]; then
+    success "Todos los dominios seleccionados (${#EXISTING_CERTS[@]}/${#DOMAINS[@]}) ya tienen certificados SSL"
     echo ""
     warning "OPCIONES:"
     echo "  1. Usar certificados existentes y solo actualizar configuración Nginx (RECOMENDADO)"
@@ -137,10 +423,10 @@ if [ ${#EXISTING_CERTS[@]} -eq ${#DOMAINS[@]} ]; then
     fi
 elif [ ${#EXISTING_CERTS[@]} -gt 0 ]; then
     info "Certificados existentes: ${#EXISTING_CERTS[@]}/${#DOMAINS[@]}"
-    info "Se procesarán todos los dominios (puedes omitir los existentes individualmente)"
+    info "Se procesarán todos los dominios seleccionados (puedes omitir los existentes individualmente)"
     echo ""
 else
-    info "No se encontraron certificados existentes"
+    info "No se encontraron certificados existentes para los dominios seleccionados"
     info "Se procederá a obtener certificados para todos los dominios"
     echo ""
 fi
@@ -212,13 +498,19 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
             success "  ✓ Certificados anteriores eliminados"
         fi
 
-        # Probar conectividad HTTP primero
+        # Probar conectividad HTTP primero (check más tolerante)
         log "  Verificando que $DOMAIN es accesible vía HTTP..."
-        if curl -s -f -o /dev/null --max-time 5 "http://$DOMAIN" 2>/dev/null; then
-            success "  ✓ Dominio accesible vía HTTP"
+
+        # Usar curl sin -f para aceptar cualquier respuesta HTTP (incluso 404, 500, etc.)
+        # Lo importante es que el servidor responda, no el código de estado
+        HTTP_CHECK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://$DOMAIN" 2>/dev/null || echo "000")
+
+        if [ "$HTTP_CHECK" != "000" ]; then
+            success "  ✓ Dominio accesible vía HTTP (código: $HTTP_CHECK)"
         else
-            warning "  ⚠ No se pudo verificar acceso HTTP a $DOMAIN"
+            warning "  ⚠ No se pudo conectar a $DOMAIN (sin respuesta del servidor)"
             warning "  Esto puede causar que la validación de Let's Encrypt falle"
+            info "  Posibles causas: DNS incorrecto, servidor caído, firewall bloqueando puerto 80"
             read -p "  ¿Continuar de todos modos? (s/n): " continue_anyway
             if [[ ! $continue_anyway =~ ^[Ss]$ ]]; then
                 warning "  Omitiendo $DOMAIN"
@@ -310,9 +602,20 @@ log "PASO 2: Activación de HTTPS en Nginx"
 log "═══════════════════════════════════════════════════"
 echo ""
 
-for i in "${!SUCCESSFUL_CERTS[@]}"; do
-    DOMAIN="${SUCCESSFUL_CERTS[$i]}"
-    SITE_NUM=$((i + 1))
+# Crear mapeo de dominio a número de sitio basado en el orden en .env
+declare -A DOMAIN_TO_SITE_NUM
+site_counter=1
+while IFS='=' read -r key value; do
+    if [[ "$key" =~ ^DOMAIN_[0-9]+$ ]]; then
+        domain=$(echo "$value" | tr -d '"' | tr -d "'")
+        DOMAIN_TO_SITE_NUM["$domain"]=$site_counter
+        ((site_counter++))
+    fi
+done < .env
+
+for DOMAIN in "${SUCCESSFUL_CERTS[@]}"; do
+    # Obtener el número de sitio desde el mapeo, o usar 1 por defecto
+    SITE_NUM=${DOMAIN_TO_SITE_NUM[$DOMAIN]:-1}
     CONFIG_FILE="nginx/conf.d/${DOMAIN}.conf"
 
     if [ ! -f "$CONFIG_FILE" ]; then
