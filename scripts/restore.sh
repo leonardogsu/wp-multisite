@@ -2,7 +2,7 @@
 ################################################################################
 # restore.sh - Script de restauración para WordPress Multi-Site OPTIMIZADO
 # Compatible con estructura basada en dominios sanitizados
-# Versión: 3.1 - CORREGIDO: Bugs de paralelización y manejo de errores
+# Versión: 3.2 - UNIFICADO: Gestión centralizada de wp-config.php desde .env
 #
 # Uso:
 #   ./scripts/restore.sh --site DOMINIO           # Restaura un sitio específico
@@ -16,6 +16,12 @@
 #       - Permite elegir un ZIP que contenga un SQL y un TAR
 #       - Permite elegir un sitio destino instalado
 #       - Sobrescribe la base de datos y los archivos de ese sitio
+#
+# Changelog v3.2:
+#   + UNIFICADO: Gestión centralizada de wp-config.php
+#   + NEW: update_wpconfig_from_env() actualiza credenciales DB y SFTP desde .env
+#   + REMOVED: preserve_wpconfig_credentials() ya no es necesaria
+#   + FIX: Comportamiento idéntico en --site y --external
 #
 # Changelog v3.1:
 #   + FIX: Subshells ahora usan set +e para evitar muerte prematura
@@ -92,6 +98,13 @@ register_temp_dir() {
 # --- Función para sanitizar nombres de dominio (optimizada) ---
 sanitize_domain_name() {
     echo "$1" | sed -e 's/[.-]/_/g' -e 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
+}
+
+# --- Convierte dominio a formato de variable SFTP del .env ---
+# Ejemplo: comandolibertad.com -> COMANDOLIBERTAD_COM
+domain_to_sftp_var(){
+  local domain="$1"
+  echo "$domain" | tr '[:lower:]' '[:upper:]' | sed 's/[.-]/_/g'
 }
 
 # --- docker compose shim (con caché) ---
@@ -309,6 +322,167 @@ show_site_summary(){
 }
 
 ################################################################################
+# FUNCIÓN UNIFICADA: Actualizar wp-config.php desde .env
+################################################################################
+
+# Actualiza wp-config.php con credenciales del .env
+# Uso: update_wpconfig_from_env <idx> <wpconfig_path>
+update_wpconfig_from_env(){
+  local idx="$1"
+  local wpconfig="$2"
+
+  [[ -f "$wpconfig" ]] || { warn "wp-config.php no encontrado: $wpconfig"; return 1; }
+
+  local domain="${DOMAINS[$((idx-1))]}"
+  local domain_sanitized
+  domain_sanitized=$(sanitize_domain_name "$domain")
+  local sftp_var_name
+  sftp_var_name="SFTP_$(domain_to_sftp_var "$domain")_PASSWORD"
+
+  # Obtener valores del .env
+  local db_name="$domain_sanitized"
+  local db_user="$domain_sanitized"
+  local db_password=""
+  local db_host="mysql"
+  local sftp_user="$domain_sanitized"
+  local sftp_password=""
+  local sftp_host="sftp"
+  local site_path="/var/www/html/${domain_sanitized}"
+
+  # Leer DB_PASSWORD_{idx} del .env
+  db_password=$(grep -E "^DB_PASSWORD_${idx}=" "$ENV_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+
+  # Leer SFTP password del .env
+  sftp_password=$(grep -E "^${sftp_var_name}=" "$ENV_FILE" | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
+
+  info "Actualizando wp-config.php desde .env para sitio #${idx} (${domain})..."
+
+  # Validar que tenemos las credenciales necesarias
+  if [[ -z "$db_password" ]]; then
+    warn "  ⚠ No se encontró DB_PASSWORD_${idx} en .env"
+  fi
+
+  # Crear backup del wp-config.php antes de modificar
+  cp "$wpconfig" "${wpconfig}.pre-update.bak"
+
+  # --- Actualizar configuración de base de datos ---
+  info "  Actualizando credenciales de base de datos..."
+
+  # DB_NAME
+  if grep -qE "define\s*\(\s*['\"]DB_NAME['\"]" "$wpconfig"; then
+    sed -i -E "s/(define\s*\(\s*['\"]DB_NAME['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${db_name}'/" "$wpconfig"
+  else
+    # Insertar después de la apertura de PHP o al inicio
+    sed -i "1a define('DB_NAME', '${db_name}');" "$wpconfig"
+  fi
+
+  # DB_USER
+  if grep -qE "define\s*\(\s*['\"]DB_USER['\"]" "$wpconfig"; then
+    sed -i -E "s/(define\s*\(\s*['\"]DB_USER['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${db_user}'/" "$wpconfig"
+  else
+    sed -i "/DB_NAME/a define('DB_USER', '${db_user}');" "$wpconfig"
+  fi
+
+  # DB_PASSWORD - Escapar caracteres especiales
+  local db_pass_escaped
+  db_pass_escaped=$(printf '%s\n' "$db_password" | sed 's/[&/\]/\\&/g')
+  if grep -qE "define\s*\(\s*['\"]DB_PASSWORD['\"]" "$wpconfig"; then
+    sed -i -E "s/(define\s*\(\s*['\"]DB_PASSWORD['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${db_pass_escaped}'/" "$wpconfig"
+  else
+    sed -i "/DB_USER/a define('DB_PASSWORD', '${db_password}');" "$wpconfig"
+  fi
+
+  # DB_HOST
+  if grep -qE "define\s*\(\s*['\"]DB_HOST['\"]" "$wpconfig"; then
+    sed -i -E "s/(define\s*\(\s*['\"]DB_HOST['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${db_host}'/" "$wpconfig"
+  else
+    sed -i "/DB_PASSWORD/a define('DB_HOST', '${db_host}');" "$wpconfig"
+  fi
+
+  log "  ✓ Credenciales de DB actualizadas: DB=${db_name}, USER=${db_user}, HOST=${db_host}"
+
+  # --- Actualizar configuración SFTP ---
+  if [[ -n "$sftp_password" ]]; then
+    info "  Actualizando credenciales SFTP..."
+
+    # Escapar caracteres especiales en password SFTP
+    local sftp_pass_escaped
+    sftp_pass_escaped=$(printf '%s\n' "$sftp_password" | sed 's/[&/\]/\\&/g')
+
+    # FTP_USER
+    if grep -qE "define\s*\(\s*['\"]FTP_USER['\"]" "$wpconfig"; then
+      sed -i -E "s/(define\s*\(\s*['\"]FTP_USER['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${sftp_user}'/" "$wpconfig"
+    else
+      # Añadir bloque SFTP al final
+      {
+        echo ""
+        echo "/** SFTP Configuration - Auto-generated by restore.sh */"
+        echo "define('FTP_USER', '${sftp_user}');"
+      } >> "$wpconfig"
+    fi
+
+    # FTP_PASS
+    if grep -qE "define\s*\(\s*['\"]FTP_PASS['\"]" "$wpconfig"; then
+      sed -i -E "s/(define\s*\(\s*['\"]FTP_PASS['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${sftp_pass_escaped}'/" "$wpconfig"
+    else
+      sed -i "/define.*FTP_USER/a define('FTP_PASS', '${sftp_password}');" "$wpconfig"
+    fi
+
+    # FTP_HOST
+    if grep -qE "define\s*\(\s*['\"]FTP_HOST['\"]" "$wpconfig"; then
+      sed -i -E "s/(define\s*\(\s*['\"]FTP_HOST['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'${sftp_host}'/" "$wpconfig"
+    else
+      sed -i "/define.*FTP_PASS/a define('FTP_HOST', '${sftp_host}');" "$wpconfig"
+    fi
+
+    # FTP_BASE - usar | como delimitador para evitar conflictos con /
+    if grep -qE "define\s*\(\s*['\"]FTP_BASE['\"]" "$wpconfig"; then
+      sed -i "s|define\s*(\s*['\"]FTP_BASE['\"]\s*,\s*['\"][^'\"]*['\"]|define('FTP_BASE', '${site_path}/'|" "$wpconfig"
+    else
+      sed -i "/define.*FTP_HOST/a define('FTP_BASE', '${site_path}/');" "$wpconfig"
+    fi
+
+    # FTP_CONTENT_DIR
+    if grep -qE "define\s*\(\s*['\"]FTP_CONTENT_DIR['\"]" "$wpconfig"; then
+      sed -i "s|define\s*(\s*['\"]FTP_CONTENT_DIR['\"]\s*,\s*['\"][^'\"]*['\"]|define('FTP_CONTENT_DIR', '${site_path}/wp-content/'|" "$wpconfig"
+    else
+      sed -i "/define.*FTP_BASE/a define('FTP_CONTENT_DIR', '${site_path}/wp-content/');" "$wpconfig"
+    fi
+
+    # FTP_PLUGIN_DIR
+    if grep -qE "define\s*\(\s*['\"]FTP_PLUGIN_DIR['\"]" "$wpconfig"; then
+      sed -i "s|define\s*(\s*['\"]FTP_PLUGIN_DIR['\"]\s*,\s*['\"][^'\"]*['\"]|define('FTP_PLUGIN_DIR', '${site_path}/wp-content/plugins/'|" "$wpconfig"
+    else
+      sed -i "/define.*FTP_CONTENT_DIR/a define('FTP_PLUGIN_DIR', '${site_path}/wp-content/plugins/');" "$wpconfig"
+    fi
+
+    # FS_METHOD
+    if grep -qE "define\s*\(\s*['\"]FS_METHOD['\"]" "$wpconfig"; then
+      sed -i -E "s/(define\s*\(\s*['\"]FS_METHOD['\"]\s*,\s*)['\"][^'\"]*['\"]/\1'ftpsockets'/" "$wpconfig"
+    else
+      sed -i "/define.*FTP_PLUGIN_DIR/a define('FS_METHOD', 'ftpsockets');" "$wpconfig"
+    fi
+
+    log "  ✓ Credenciales SFTP actualizadas: USER=${sftp_user}, HOST=${sftp_host}"
+  else
+    warn "  ⚠ No se encontró ${sftp_var_name} en .env - SFTP no configurado"
+
+    # Asegurar al menos FS_METHOD direct si no hay SFTP
+    if ! grep -qE "define\s*\(\s*['\"]FS_METHOD['\"]" "$wpconfig"; then
+      {
+        echo ""
+        echo "/** Filesystem Method */"
+        echo "define('FS_METHOD', 'direct');"
+      } >> "$wpconfig"
+      info "  FS_METHOD configurado como 'direct'"
+    fi
+  fi
+
+  log "✓ wp-config.php actualizado correctamente para ${domain}"
+  return 0
+}
+
+################################################################################
 # FUNCIONES DE RESTAURACIÓN CON TEMPORALES GESTIONADOS
 ################################################################################
 
@@ -516,6 +690,13 @@ finalize_files_move(){
   fi
 
   if [[ -d "$site_dir" ]]; then
+    # NUEVO v3.2: Actualizar wp-config.php desde .env (comportamiento unificado)
+    if [[ -f "${site_dir}/wp-config.php" ]]; then
+      update_wpconfig_from_env "$idx" "${site_dir}/wp-config.php"
+    else
+      warn "⚠ No se encontró wp-config.php en ${site_dir}"
+    fi
+
     cleanup_and_verify_site "$site_dir"
     log "  ✓ Archivos instalados en www/${domain_sanitized}"
   else
@@ -680,14 +861,6 @@ restore_from_external_zip(){
 
   info "⚡ Iniciando restauración paralela desde ZIP externo..."
 
-  # Guardar wp-config.php actual antes de hacer backup del sitio
-  local OLD_WPCONFIG=""
-  if [[ -f "${site_dir}/wp-config.php" ]]; then
-    OLD_WPCONFIG="$(register_temp "old_wpconfig.php")"
-    cp "${site_dir}/wp-config.php" "$OLD_WPCONFIG"
-    info "  wp-config.php actual guardado temporalmente"
-  fi
-
   # Base de datos en background - CORREGIDO
   (
     trap - EXIT INT TERM
@@ -740,12 +913,15 @@ restore_from_external_zip(){
   mv "$inner_dir"/* "$site_dir/"
   mv "$inner_dir"/.[!.]* "$site_dir/" 2>/dev/null || true
 
-  # Preservar credenciales del wp-config.php antiguo
-  if [[ -n "$OLD_WPCONFIG" && -f "$OLD_WPCONFIG" ]]; then
-    preserve_wpconfig_credentials "$OLD_WPCONFIG" "${site_dir}/wp-config.php"
+  # NUEVO v3.2: Actualizar wp-config.php desde .env (comportamiento unificado)
+  # Reemplaza la antigua preserve_wpconfig_credentials()
+  if [[ -f "${site_dir}/wp-config.php" ]]; then
+    update_wpconfig_from_env "$selection" "${site_dir}/wp-config.php"
+  else
+    warn "⚠ No se encontró wp-config.php en ${site_dir}"
   fi
 
-  # Limpiar caché y verificar configuración SFTP
+  # Limpiar caché y verificar configuración
   cleanup_and_verify_site "$site_dir"
 
   log "✓ Archivos restaurados en www/${domain_sanitized}"
@@ -888,44 +1064,6 @@ _extract_tar_autodetect(){
   esac
 }
 
-preserve_wpconfig_credentials(){
-  local old_config="$1"
-  local new_config="$2"
-
-  [[ -f "$old_config" ]] || { warn "No se encontró wp-config.php antiguo, usando el del backup"; return; }
-  [[ -f "$new_config" ]] || { warn "No se encontró wp-config.php nuevo"; return; }
-
-  info "Preservando credenciales de DB y SFTP del wp-config.php actual..."
-
-  # Crear archivo temporal GESTIONADO con las definiciones a preservar
-  local TMP_DEFS; TMP_DEFS="$(register_temp "wpconfig_defs.txt")"
-
-  grep -E "^define\(\s*['\"]((DB|FTP|FTPS?)_(NAME|USER|PASSWORD|PASS|HOST|CHARSET|COLLATE|SSL|PUBKEY|PRIKEY|PORT)|FS_METHOD)['\"]" "$old_config" > "$TMP_DEFS" || true
-
-  if [[ ! -s "$TMP_DEFS" ]]; then
-    warn "No se encontraron definiciones de DB o SFTP para preservar"
-    return
-  fi
-
-  # Crear backup del nuevo config antes de modificar
-  cp "$new_config" "${new_config}.bak"
-
-  # Eliminar las definiciones antiguas del nuevo archivo
-  sed -i -E '/^define\(\s*['\''"]((DB|FTP|FTPS?)_(NAME|USER|PASSWORD|PASS|HOST|CHARSET|COLLATE|SSL|PUBKEY|PRIKEY|PORT)|FS_METHOD)['\''"].*$/d' "$new_config"
-
-  # Insertar las definiciones preservadas después de la línea de configuración de MySQL
-  local insert_line
-  insert_line=$(grep -n "\/\*\*.*MySQL\|\/\*\*.*database\|\/\/ \*\* MySQL" "$new_config" | tail -1 | cut -d: -f1 || echo "")
-
-  if [[ -n "$insert_line" ]]; then
-    sed -i "${insert_line}r $TMP_DEFS" "$new_config"
-  else
-    sed -i "1r $TMP_DEFS" "$new_config"
-  fi
-
-  log "✓ Credenciales de DB y SFTP preservadas en wp-config.php"
-}
-
 cleanup_and_verify_site(){
   local site_dir="$1"
   local domain_sanitized=$(basename "$site_dir")
@@ -946,29 +1084,10 @@ cleanup_and_verify_site(){
     fi
   done
 
-  # Verificar y corregir configuración SFTP en wp-config.php
-  if [[ -f "${site_dir}/wp-config.php" ]]; then
-    info "Verificando configuración SFTP en wp-config.php..."
+  # Nota: La verificación de SFTP ya no es necesaria aquí porque
+  # update_wpconfig_from_env() ya configuró todo correctamente
 
-    if ! grep -q "define.*FS_METHOD" "${site_dir}/wp-config.php"; then
-      sed -i "/define.*DB_COLLATE/a\\\n/** Método de acceso al sistema de archivos */\ndefine('FS_METHOD', 'direct');" "${site_dir}/wp-config.php"
-      info "  ✓ FS_METHOD configurado en wp-config.php"
-    fi
-
-    if grep -q "FTP_BASE" "${site_dir}/wp-config.php"; then
-      local expected_path="/var/www/html/${domain_sanitized}/"
-      if ! grep -q "define.*FTP_BASE.*${expected_path}" "${site_dir}/wp-config.php"; then
-        warn "  ⚠ FTP_BASE puede estar apuntando a un directorio incorrecto"
-        info "    Verifica que apunte a: ${expected_path}"
-      else
-        info "  ✓ FTP_BASE configurado correctamente"
-      fi
-    fi
-
-    log "  ✓ Configuración SFTP verificada"
-  else
-    warn "  ⚠ No se encontró wp-config.php en ${site_dir}"
-  fi
+  log "  ✓ Sitio verificado y caché limpiada"
 }
 
 restart_services(){
@@ -1013,7 +1132,7 @@ restart_services(){
 ################################################################################
 
 main(){
-  log "🔄 Iniciando restauración de backup [VERSIÓN CORREGIDA v3.1]..."
+  log "🔄 Iniciando restauración de backup [VERSIÓN UNIFICADA v3.2]..."
   cd "$PROJECT_DIR" || die "No se pudo acceder al proyecto"
   load_env
   detect_mysql_container || die "No se encontró contenedor MySQL"
@@ -1039,7 +1158,7 @@ main(){
   restart_services
   log "✅ Proceso de restauración finalizado"
   info "Verifica que el sitio funcione correctamente"
-  info "📊 Estadísticas: Limpieza automática garantizada | Paralelización DB+Files activa"
+  info "📊 Estadísticas: Limpieza automática garantizada | Paralelización DB+Files activa | wp-config.php unificado"
 }
 
 main "$@"
