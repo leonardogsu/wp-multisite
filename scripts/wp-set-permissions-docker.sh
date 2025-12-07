@@ -21,9 +21,9 @@ CONTAINER_NAME="php"
 WP_PATH_CONTAINER="/var/www/html"
 WEB_USER="www-data"
 WEB_GROUP="www-data"
-# UID/GID para compatibilidad con SFTP (atmoz/sftp usa 33:33)
-SFTP_UID="33"
-SFTP_GID="33"
+# UID/GID para compatibilidad con SFTP y PHP-FPM Alpine (wordpress:php-fpm-alpine usa 82:82)
+SFTP_UID="82"
+SFTP_GID="82"
 
 ###########################################
 # Funciones auxiliares
@@ -63,8 +63,8 @@ Opciones:
     --path       Ruta dentro del contenedor (default: /var/www/html)
     --user       Usuario web (default: www-data)
     --group      Grupo web (default: www-data)
-    --sftp-uid   UID del usuario SFTP (default: 33)
-    --sftp-gid   GID del usuario SFTP (default: 33)
+    --sftp-uid   UID del usuario SFTP (default: 82)
+    --sftp-gid   GID del usuario SFTP (default: 82)
     --strict     Modo estricto (sin compatibilidad SFTP)
     --help       Muestra esta ayuda
 

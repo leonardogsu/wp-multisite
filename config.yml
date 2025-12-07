@@ -29,3 +29,4 @@ options:
   # Monitoreo en tiempo real con Netdata
   # Acceso por túnel SSH: ssh -L 19999:localhost:19999 root@IP
   install_netdata: true
+  install_redis: true

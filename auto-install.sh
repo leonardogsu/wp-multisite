@@ -34,6 +34,7 @@ declare IP_VERSION=""
 declare MYSQL_ROOT_PASSWORD=""
 declare SETUP_CRON=false
 declare INSTALL_NETDATA=false
+declare INSTALL_REDIS=false
 declare UNATTENDED_MODE=false
 
 # Crear directorio de logs
@@ -302,6 +303,10 @@ load_config_from_yaml() {
     install_netdata_config=$(yq eval '.options.install_netdata' "$CONFIG_FILE" 2>/dev/null || echo "false")
     [[ "$install_netdata_config" == "true" ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
 
+    local install_redis_config
+    install_redis_config=$(yq eval '.options.install_redis' "$CONFIG_FILE" 2>/dev/null || echo "false")
+    [[ "$install_redis_config" == "true" ]] && INSTALL_REDIS=true || INSTALL_REDIS=false
+
     success "✓ Configuración cargada desde YAML"
     return 0
 }
@@ -394,6 +399,11 @@ gather_user_input() {
         echo ""
         read -rp "¿Instalar Netdata (monitoreo en tiempo real)? (s/n): " setup_netdata
         [[ $setup_netdata =~ ^[Ss]$ ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
+
+        # Pregunta sobre Redis
+        echo ""
+        read -rp "¿Instalar Redis (caché de objetos para WordPress)? (s/n): " setup_redis
+        [[ $setup_redis =~ ^[Ss]$ ]] && INSTALL_REDIS=true || INSTALL_REDIS=false
     fi
 
     # Mostrar resumen (tanto para modo interactivo como desatendido)
@@ -411,6 +421,7 @@ gather_user_input() {
     success "  ✓ phpMyAdmin: INCLUIDO"
     success "  ✓ SFTP Server: INCLUIDO (puerto 2222)"
     [[ $INSTALL_NETDATA == true ]] && success "  ✓ Netdata: INCLUIDO (puerto 19999)"
+    [[ $INSTALL_REDIS == true ]] && success "  ✓ Redis: INCLUIDO (caché de objetos)"
     echo "  Backup: $([[ $SETUP_CRON == true ]] && echo 'Sí' || echo 'No')"
     echo "  Directorio: $INSTALL_DIR"
     [[ $UNATTENDED_MODE == true ]] && echo "  Modo: DESATENDIDO"
@@ -914,9 +925,190 @@ set_wordpress_permissions() {
         success "✓ Permisos configurados para ${domain}"
     done
 
-    success "✓ Permisos de WordPress configurados"
-    info "  - Todo wp-content: 775 (escritura completa habilitada)"
-    info "  - Subdirectorios se crearán automáticamente con permisos correctos"
+    success "✓ Permisos base de WordPress configurados"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # PERMISOS HÍBRIDOS: Seguros + SFTP Compatible
+    # ═══════════════════════════════════════════════════════════════════════
+    log "Aplicando permisos híbridos (seguros + SFTP compatible)..."
+
+    # El contenedor wordpress:php-fpm-alpine usa UID:GID 82:82 (www-data en Alpine)
+    # SFTP también debe usar 82:82 para compatibilidad
+
+    for i in "${!DOMAINS[@]}"; do
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local site_path="$INSTALL_DIR/www/${domain_sanitized}"
+
+        if [[ -d "$site_path" ]]; then
+            log "Aplicando permisos híbridos a ${domain}..."
+
+            # 1. Propietario: 82:82 para todo (compatible SFTP y PHP-FPM Alpine)
+            chown -R 82:82 "$site_path"
+
+            # 2. CORE (solo lectura - máxima seguridad): 755 para dirs, 644 para archivos
+            # Esto protege wp-admin, wp-includes y archivos PHP raíz
+            find "$site_path" -type d -exec chmod 755 {} \;
+            find "$site_path" -type f -exec chmod 644 {} \;
+
+            # 3. wp-config.php: permisos más restrictivos (440)
+            if [[ -f "$site_path/wp-config.php" ]]; then
+                chmod 440 "$site_path/wp-config.php"
+            fi
+
+            # 4. WP-CONTENT (escritura habilitada - SFTP compatible): 775/664
+            if [[ -d "$site_path/wp-content" ]]; then
+                # Directorio principal wp-content
+                chmod 775 "$site_path/wp-content"
+
+                # Subdirectorios que necesitan escritura
+                for subdir in uploads plugins themes upgrade cache languages; do
+                    if [[ -d "$site_path/wp-content/$subdir" ]]; then
+                        find "$site_path/wp-content/$subdir" -type d -exec chmod 775 {} \;
+                        find "$site_path/wp-content/$subdir" -type f -exec chmod 664 {} \;
+                    fi
+                done
+
+                # Crear directorios si no existen
+                for subdir in uploads plugins themes upgrade; do
+                    mkdir -p "$site_path/wp-content/$subdir"
+                    chown 82:82 "$site_path/wp-content/$subdir"
+                    chmod 775 "$site_path/wp-content/$subdir"
+                done
+            fi
+
+            success "✓ Permisos híbridos aplicados a ${domain}"
+        fi
+    done
+
+    echo ""
+    success "✓ PERMISOS HÍBRIDOS CONFIGURADOS"
+    echo ""
+    info "  PROTEGIDO (solo lectura):"
+    info "    • wp-admin/, wp-includes/: 755/644"
+    info "    • Archivos PHP raíz: 644"
+    info "    • wp-config.php: 440"
+    echo ""
+    info "  ESCRITURA HABILITADA (SFTP + WordPress):"
+    info "    • wp-content/uploads/: 775/664"
+    info "    • wp-content/plugins/: 775/664"
+    info "    • wp-content/themes/: 775/664"
+    info "    • wp-content/upgrade/: 775/664"
+    echo ""
+    info "  Propietario: 82:82 (www-data Alpine, compatible SFTP y PHP-FPM)"
+
+    echo ""
+    sleep 2
+}
+
+# Configurar Redis
+setup_redis() {
+    if [[ $INSTALL_REDIS != true ]]; then
+        return 0
+    fi
+
+    banner "═══════════════════════════════════════════════════════════════════════"
+    banner "  PASO 13: Instalación de Redis"
+    banner "═══════════════════════════════════════════════════════════════════════"
+    echo ""
+
+    log "Verificando que Redis esté corriendo..."
+
+    # Verificar que el contenedor Redis esté activo
+    if ! docker compose ps --status running 2>/dev/null | grep -q "redis"; then
+        warning "Contenedor Redis no está corriendo, iniciándolo..."
+        docker compose up -d redis >> "$LOG_FILE" 2>&1 || {
+            error "No se pudo iniciar Redis"
+        }
+        sleep 5
+    fi
+
+    # Verificar conexión a Redis
+    if docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q "PONG"; then
+        success "✓ Redis está corriendo y responde"
+    else
+        error "Redis no responde"
+    fi
+
+    log "Configurando Redis para cada sitio WordPress..."
+
+    for i in "${!DOMAINS[@]}"; do
+        local domain="${DOMAINS[$i]}"
+        local domain_sanitized=$(sanitize_domain_name "$domain")
+        local site_path="$INSTALL_DIR/www/${domain_sanitized}"
+        local wp_config_path="$site_path/wp-config.php"
+        local redis_prefix="${domain_sanitized}_"
+
+        log "Configurando Redis para ${domain}..."
+
+        # Verificar que existe wp-config.php
+        if [[ ! -f "$wp_config_path" ]]; then
+            warning "wp-config.php no encontrado para ${domain}, saltando..."
+            continue
+        fi
+
+        # Verificar si ya está configurado
+        if grep -q "WP_REDIS_HOST" "$wp_config_path" 2>/dev/null; then
+            info "Redis ya configurado en ${domain}"
+            continue
+        fi
+
+        # Crear configuración de Redis
+        local redis_config="
+/* Redis Object Cache Configuration */
+define('WP_REDIS_HOST', 'redis');
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_PREFIX', '${redis_prefix}');
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_TIMEOUT', 1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+define('WP_CACHE', true);
+"
+
+        # Insertar configuración antes de "That's all, stop editing!"
+        if grep -q "That's all, stop editing!" "$wp_config_path"; then
+            sed -i "/That's all, stop editing!/i\\${redis_config}" "$wp_config_path"
+        elif grep -q "require_once ABSPATH" "$wp_config_path"; then
+            sed -i "/require_once ABSPATH/i\\${redis_config}" "$wp_config_path"
+        fi
+
+        # Descargar e instalar plugin Redis Object Cache
+        docker compose exec -T php sh -c "
+            cd /var/www/html/${domain_sanitized}
+
+            # Crear directorio de plugins si no existe
+            mkdir -p wp-content/plugins
+
+            # Descargar plugin si no existe
+            if [ ! -d 'wp-content/plugins/redis-cache' ]; then
+                cd wp-content/plugins
+                wget -q https://downloads.wordpress.org/plugin/redis-cache.latest-stable.zip -O redis-cache.zip 2>/dev/null
+                if [ -f redis-cache.zip ]; then
+                    unzip -q redis-cache.zip 2>/dev/null
+                    rm -f redis-cache.zip
+                fi
+            fi
+
+            # Copiar object-cache.php drop-in
+            if [ -f 'wp-content/plugins/redis-cache/includes/object-cache.php' ]; then
+                cp wp-content/plugins/redis-cache/includes/object-cache.php ../object-cache.php 2>/dev/null
+            fi
+        " >> "$LOG_FILE" 2>&1 || warning "No se pudo instalar plugin automáticamente para ${domain}"
+
+        # Corregir permisos
+        chown -R 82:82 "$site_path/wp-content/plugins/" 2>/dev/null || true
+        chown 82:82 "$site_path/wp-content/object-cache.php" 2>/dev/null || true
+
+        success "✓ Redis configurado para ${domain}"
+    done
+
+    echo ""
+    success "✓ Redis instalado y configurado"
+    info "  - Host: redis"
+    info "  - Puerto: 6379"
+    info "  - Cada sitio tiene su propio prefijo de caché"
+    info "  - Plugin: Redis Object Cache (activar desde wp-admin)"
+
     echo ""
     sleep 2
 }
@@ -1042,6 +1234,15 @@ show_final_summary() {
         echo "    Luego en navegador: http://localhost:19999"
     fi
 
+    if [[ $INSTALL_REDIS == true ]]; then
+        echo ""
+        info "  Redis (caché de objetos):"
+        echo "    Host interno: redis:6379"
+        echo "    Plugin: Redis Object Cache (activar en cada wp-admin)"
+        echo "    Ver estado: docker compose exec redis redis-cli INFO"
+        echo "    Limpiar caché: docker compose exec redis redis-cli FLUSHALL"
+    fi
+
     echo ""
     echo "  Accesos SFTP por sitio:"
     for i in "${!DOMAINS[@]}"; do
@@ -1068,6 +1269,10 @@ show_final_summary() {
     if [[ $INSTALL_NETDATA == true ]]; then
         echo "  Netdata: systemctl status netdata"
     fi
+    if [[ $INSTALL_REDIS == true ]]; then
+        echo "  Redis status: docker compose exec redis redis-cli INFO"
+        echo "  Redis config: ./scripts/setup-redis.sh"
+    fi
     echo ""
 
     success "¡Sistema WordPress multi-sitio listo!"
@@ -1091,6 +1296,7 @@ main() {
     generate_configurations
     setup_wordpress
     set_wordpress_permissions
+    setup_redis
     configure_backup
     show_final_summary
 }
