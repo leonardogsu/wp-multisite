@@ -5,6 +5,7 @@
 # Versión refactorizada usando sistema de plantillas
 # Para Ubuntu 24.04 LTS
 # VERSIÓN ACTUALIZADA - SFTP + NETDATA + Nombres basados en dominio
+# + IPv4/IPv6 selection + YAML configuration
 ################################################################################
 
 set -euo pipefail
@@ -14,6 +15,7 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_NAME="wordpress-multisite"
 readonly INSTALL_DIR="/opt/$PROJECT_NAME"
 readonly LOG_FILE="/var/log/${PROJECT_NAME}-install.log"
+readonly CONFIG_FILE="$SCRIPT_DIR/config.yml"
 
 # Colores
 readonly RED='\033[0;31m'
@@ -28,9 +30,11 @@ declare -a DOMAINS=()
 declare -a SFTP_PASSWORDS=()
 declare -a DB_PASSWORDS=()
 declare SERVER_IP=""
+declare IP_VERSION=""
 declare MYSQL_ROOT_PASSWORD=""
 declare SETUP_CRON=false
 declare INSTALL_NETDATA=false
+declare UNATTENDED_MODE=false
 
 # Crear directorio de logs
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -66,12 +70,24 @@ show_main_banner() {
 ║                                                                       ║
 ║                  Instalación Completamente Automatizada               ║
 ║                   Incluye: phpMyAdmin + SFTP Server                   ║
+║                   + IPv4/IPv6 + YAML Configuration                    ║
 ║                                                                       ║
 ╚═══════════════════════════════════════════════════════════════════════╝
 EOF
     echo ""
     log "Iniciando instalación automática completa..."
     log "Logs: $LOG_FILE"
+
+    # Verificar si existe archivo de configuración
+    if [[ -f "$CONFIG_FILE" ]]; then
+        success "✓ Archivo de configuración encontrado: $CONFIG_FILE"
+        UNATTENDED_MODE=true
+        log "Modo: DESATENDIDO (configuración desde YAML)"
+    else
+        info "Archivo de configuración no encontrado: $CONFIG_FILE"
+        log "Modo: INTERACTIVO"
+    fi
+
     echo ""
     sleep 2
 }
@@ -87,8 +103,12 @@ verify_system_requirements() {
     info "Verificando Ubuntu..."
     if ! grep -q "24.04" /etc/os-release; then
         warning "Diseñado para Ubuntu 24.04 LTS"
-        read -rp "¿Continuar? (s/n): " continue
-        [[ $continue =~ ^[Ss]$ ]] || error "Instalación cancelada"
+        if [[ $UNATTENDED_MODE == false ]]; then
+            read -rp "¿Continuar? (s/n): " continue
+            [[ $continue =~ ^[Ss]$ ]] || error "Instalación cancelada"
+        else
+            warning "Continuando en modo desatendido..."
+        fi
     else
         success "✓ Ubuntu 24.04 LTS"
     fi
@@ -117,61 +137,206 @@ verify_system_requirements() {
     sleep 2
 }
 
-# Recopilar información del usuario
+# Detectar direcciones IP (IPv4 e IPv6)
+detect_ip_addresses() {
+    local ipv4=""
+    local ipv6=""
+
+    # Detectar IPv4
+    ipv4=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || \
+           curl -4 -s --max-time 10 icanhazip.com 2>/dev/null || \
+           ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || \
+           echo "")
+
+    # Detectar IPv6
+    ipv6=$(curl -6 -s --max-time 10 ifconfig.me 2>/dev/null || \
+           curl -6 -s --max-time 10 icanhazip.com 2>/dev/null || \
+           ip -6 addr show scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80' | head -n1 || \
+           echo "")
+
+    echo "$ipv4|$ipv6"
+}
+
+# Cargar configuración desde YAML
+load_config_from_yaml() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+
+    log "Cargando configuración desde $CONFIG_FILE..."
+
+    # Verificar que yq esté instalado
+    if ! command -v yq &>/dev/null; then
+        error "yq no está instalado. Ejecuta primero: apt-get install -y yq"
+    fi
+
+    # Cargar IP version
+    local ip_version_config
+    ip_version_config=$(yq eval '.server.ip_version' "$CONFIG_FILE" 2>/dev/null || echo "ipv4")
+    IP_VERSION="${ip_version_config,,}"  # convertir a minúsculas
+
+    # Cargar IP address (si está especificada)
+    local ip_address_config
+    ip_address_config=$(yq eval '.server.ip_address' "$CONFIG_FILE" 2>/dev/null || echo "")
+
+    if [[ -n "$ip_address_config" && "$ip_address_config" != "null" ]]; then
+        SERVER_IP="$ip_address_config"
+        success "✓ IP desde config: $SERVER_IP"
+    else
+        # Detectar automáticamente según versión
+        local detected_ips
+        detected_ips=$(detect_ip_addresses)
+        local ipv4="${detected_ips%%|*}"
+        local ipv6="${detected_ips##*|}"
+
+        case "$IP_VERSION" in
+            ipv4)
+                SERVER_IP="$ipv4"
+                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar IPv4"
+                ;;
+            ipv6)
+                SERVER_IP="$ipv6"
+                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar IPv6"
+                ;;
+            both|dual)
+                # Preferir IPv4 si está disponible
+                SERVER_IP="${ipv4:-$ipv6}"
+                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar ninguna IP"
+                ;;
+            *)
+                error "ip_version inválida en config: $IP_VERSION (usa: ipv4, ipv6, both)"
+                ;;
+        esac
+        success "✓ IP detectada ($IP_VERSION): $SERVER_IP"
+    fi
+
+    # Cargar dominios
+    local domain_count
+    domain_count=$(yq eval '.domains | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+
+    if [[ "$domain_count" -eq 0 ]]; then
+        error "No hay dominios configurados en $CONFIG_FILE"
+    fi
+
+    for ((i=0; i<domain_count; i++)); do
+        local domain
+        domain=$(yq eval ".domains[$i]" "$CONFIG_FILE" 2>/dev/null)
+        if [[ -n "$domain" && "$domain" != "null" ]]; then
+            DOMAINS+=("$domain")
+        fi
+    done
+
+    success "✓ Dominios cargados: ${#DOMAINS[@]}"
+
+    # Cargar opciones
+    local setup_cron_config
+    setup_cron_config=$(yq eval '.options.setup_cron' "$CONFIG_FILE" 2>/dev/null || echo "false")
+    [[ "$setup_cron_config" == "true" ]] && SETUP_CRON=true || SETUP_CRON=false
+
+    local install_netdata_config
+    install_netdata_config=$(yq eval '.options.install_netdata' "$CONFIG_FILE" 2>/dev/null || echo "false")
+    [[ "$install_netdata_config" == "true" ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
+
+    success "✓ Configuración cargada desde YAML"
+    return 0
+}
+
+# Recopilar información del usuario (modo interactivo)
 gather_user_input() {
     banner "═══════════════════════════════════════════════════════════════════════"
     banner "  PASO 2: Recopilación de información"
     banner "═══════════════════════════════════════════════════════════════════════"
     echo ""
 
-    # Detectar IP
-    info "Detectando IP pública..."
-    SERVER_IP=$(curl -s --max-time 10 ifconfig.me || curl -s --max-time 10 icanhazip.com || echo "")
-
-    if [[ -z "$SERVER_IP" ]]; then
-        read -rp "Ingresa la IP del servidor: " SERVER_IP
+    # Si hay archivo YAML, cargar desde ahí
+    if [[ $UNATTENDED_MODE == true ]]; then
+        load_config_from_yaml || error "Error al cargar configuración desde YAML"
     else
-        echo "  IP detectada: $SERVER_IP"
-        read -rp "  ¿Es correcta? (s/n): " confirm
-        if [[ ! $confirm =~ ^[Ss]$ ]]; then
-            read -rp "  Ingresa la IP correcta: " SERVER_IP
-        fi
+        # Modo interactivo original con selección de IP
+        info "Detectando direcciones IP..."
+        local detected_ips
+        detected_ips=$(detect_ip_addresses)
+        local ipv4="${detected_ips%%|*}"
+        local ipv6="${detected_ips##*|}"
+
+        echo ""
+        info "Direcciones IP detectadas:"
+        [[ -n "$ipv4" ]] && echo "  1) IPv4: $ipv4" || echo "  1) IPv4: (no detectada)"
+        [[ -n "$ipv6" ]] && echo "  2) IPv6: $ipv6" || echo "  2) IPv6: (no detectada)"
+        echo "  3) Ingresar manualmente"
+        echo ""
+
+        local ip_choice
+        while true; do
+            read -rp "Selecciona opción [1-3]: " ip_choice
+            case "$ip_choice" in
+                1)
+                    if [[ -n "$ipv4" ]]; then
+                        SERVER_IP="$ipv4"
+                        IP_VERSION="ipv4"
+                        break
+                    else
+                        warning "IPv4 no disponible"
+                    fi
+                    ;;
+                2)
+                    if [[ -n "$ipv6" ]]; then
+                        SERVER_IP="$ipv6"
+                        IP_VERSION="ipv6"
+                        break
+                    else
+                        warning "IPv6 no disponible"
+                    fi
+                    ;;
+                3)
+                    read -rp "Ingresa la IP del servidor: " SERVER_IP
+                    read -rp "¿Es IPv4 o IPv6? (4/6): " version_choice
+                    [[ "$version_choice" == "6" ]] && IP_VERSION="ipv6" || IP_VERSION="ipv4"
+                    break
+                    ;;
+                *)
+                    warning "Opción inválida"
+                    ;;
+            esac
+        done
+
+        success "IP seleccionada ($IP_VERSION): $SERVER_IP"
+
+        # Dominios
+        echo ""
+        info "Ingresa los dominios (Enter vacío para terminar):"
+        local counter=1
+        while true; do
+            read -rp "  Dominio $counter: " domain
+            [[ -z "$domain" ]] && break
+
+            if [[ $domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+                DOMAINS+=("$domain")
+                ((counter++))
+            else
+                warning "    Formato inválido"
+            fi
+        done
+
+        [[ ${#DOMAINS[@]} -gt 0 ]] || error "Debes ingresar al menos un dominio"
+
+        # Backup automático
+        echo ""
+        read -rp "¿Configurar backup automático diario? (s/n): " setup_cron
+        [[ $setup_cron =~ ^[Ss]$ ]] && SETUP_CRON=true || SETUP_CRON=false
+
+        # Pregunta sobre Netdata
+        echo ""
+        read -rp "¿Instalar Netdata (monitoreo en tiempo real)? (s/n): " setup_netdata
+        [[ $setup_netdata =~ ^[Ss]$ ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
     fi
 
-    # Dominios
-    echo ""
-    info "Ingresa los dominios (Enter vacío para terminar):"
-    local counter=1
-    while true; do
-        read -rp "  Dominio $counter: " domain
-        [[ -z "$domain" ]] && break
-
-        if [[ $domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-            DOMAINS+=("$domain")
-            ((counter++))
-        else
-            warning "    Formato inválido"
-        fi
-    done
-
-    [[ ${#DOMAINS[@]} -gt 0 ]] || error "Debes ingresar al menos un dominio"
-
-    # Backup automático
-    echo ""
-    read -rp "¿Configurar backup automático diario? (s/n): " setup_cron
-    [[ $setup_cron =~ ^[Ss]$ ]] && SETUP_CRON=true || SETUP_CRON=false
-
-    # Pregunta sobre Netdata
-    echo ""
-    read -rp "¿Instalar Netdata (monitoreo en tiempo real)? (s/n): " setup_netdata
-    [[ $setup_netdata =~ ^[Ss]$ ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
-
-    # Mostrar resumen
+    # Mostrar resumen (tanto para modo interactivo como desatendido)
     echo ""
     banner "═══════════════════════════════════════════════════════════════════════"
     banner "  RESUMEN DE CONFIGURACIÓN"
     banner "═══════════════════════════════════════════════════════════════════════"
-    echo "  IP: $SERVER_IP"
+    echo "  IP ($IP_VERSION): $SERVER_IP"
     echo "  Sitios: ${#DOMAINS[@]}"
     for domain in "${DOMAINS[@]}"; do
         local domain_sanitized=$(sanitize_domain_name "$domain")
@@ -183,10 +348,15 @@ gather_user_input() {
     [[ $INSTALL_NETDATA == true ]] && success "  ✓ Netdata: INCLUIDO (puerto 19999)"
     echo "  Backup: $([[ $SETUP_CRON == true ]] && echo 'Sí' || echo 'No')"
     echo "  Directorio: $INSTALL_DIR"
+    [[ $UNATTENDED_MODE == true ]] && echo "  Modo: DESATENDIDO"
     echo ""
 
-    read -rp "¿Continuar? (s/n): " confirm
-    [[ $confirm =~ ^[Ss]$ ]] || error "Instalación cancelada"
+    if [[ $UNATTENDED_MODE == false ]]; then
+        read -rp "¿Continuar? (s/n): " confirm
+        [[ $confirm =~ ^[Ss]$ ]] || error "Instalación cancelada"
+    else
+        info "Continuando en modo desatendido..."
+    fi
 
     echo ""
     sleep 2
@@ -213,9 +383,9 @@ update_system() {
     apt-get install -y -qq \
         apt-transport-https ca-certificates curl gnupg lsb-release \
         software-properties-common git wget unzip pwgen jq ufw cron \
-        apache2-utils openssh-client \
+        apache2-utils openssh-client yq \
         >> "$LOG_FILE" 2>&1 || error "Error al instalar dependencias"
-    success "✓ Dependencias instaladas"
+    success "✓ Dependencias instaladas (incluyendo yq)"
 
     echo ""
     sleep 2
@@ -388,13 +558,18 @@ check_existing_mysql() {
 
     if docker volume inspect mysql-data &>/dev/null; then
         warning "Volumen MySQL existente detectado"
-        read -rp "¿Eliminar datos anteriores? (s/n): " remove_data
 
-        if [[ $remove_data =~ ^[Ss]$ ]]; then
-            docker volume rm mysql-data >> "$LOG_FILE" 2>&1 || true
-            success "✓ Volumen eliminado"
+        if [[ $UNATTENDED_MODE == false ]]; then
+            read -rp "¿Eliminar datos anteriores? (s/n): " remove_data
+            if [[ $remove_data =~ ^[Ss]$ ]]; then
+                docker volume rm mysql-data >> "$LOG_FILE" 2>&1 || true
+                success "✓ Volumen eliminado"
+            else
+                info "Usando volumen existente"
+            fi
         else
-            info "Usando volumen existente"
+            warning "Modo desatendido: conservando volumen existente"
+            info "Para eliminarlo, detén los contenedores y ejecuta: docker volume rm mysql-data"
         fi
     else
         success "✓ No hay volumen previo"
@@ -460,6 +635,7 @@ MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
 
 # Servidor
 SERVER_IP=$SERVER_IP
+IP_VERSION=$IP_VERSION
 
 # Opciones
 INSTALL_PHPMYADMIN=true
@@ -494,6 +670,7 @@ EOF
     # Exportar las variables para que estén disponibles en los scripts hijos
     export MYSQL_ROOT_PASSWORD
     export SERVER_IP
+    export IP_VERSION
 
     # Exportar contraseñas DB
     for i in "${!DOMAINS[@]}"; do
@@ -552,6 +729,7 @@ generate_configurations() {
     # Asegurar que las variables estén exportadas
     export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
     export SERVER_IP="${SERVER_IP}"
+    export IP_VERSION="${IP_VERSION}"
 
     # Exportar contraseñas DB
     for i in "${!DOMAINS[@]}"; do
@@ -583,6 +761,7 @@ setup_wordpress() {
     # Asegurar que las variables estén disponibles
     export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
     export SERVER_IP="${SERVER_IP}"
+    export IP_VERSION="${IP_VERSION}"
 
     # Exportar contraseñas DB
     for i in "${!DOMAINS[@]}"; do
@@ -804,7 +983,7 @@ show_final_summary() {
     echo ""
 
     info "═══ PRÓXIMOS PASOS ═══"
-    echo "  1. Apuntar DNS a: $SERVER_IP"
+    echo "  1. Apuntar DNS a: $SERVER_IP ($IP_VERSION)"
     echo "  2. Ejecutar: cd $INSTALL_DIR && sudo ./scripts/setup-ssl.sh"
     echo "  3. Instalar WordPress en cada dominio:"
     for domain in "${DOMAINS[@]}"; do

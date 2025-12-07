@@ -471,6 +471,9 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
     SUCCESSFUL_CERTS=()
     FAILED_CERTS=()
 
+    # Array asociativo para guardar las preferencias de www
+    declare -A WWW_PREFERENCES
+
     for DOMAIN in "${DOMAINS[@]}"; do
         log "Procesando dominio: $DOMAIN"
 
@@ -498,6 +501,24 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
             success "  ✓ Certificados anteriores eliminados"
         fi
 
+        # NUEVA FUNCIONALIDAD: Preguntar si incluir www
+        echo ""
+        info "  ¿Deseas incluir www.$DOMAIN en el certificado?"
+        echo "  ${YELLOW}NOTA:${NC} Solo responde 'sí' si el DNS de www.$DOMAIN está configurado"
+        echo "        y apunta a este servidor. De lo contrario, la validación fallará."
+        echo ""
+        read -p "  ¿Incluir www.$DOMAIN? (s/n): " include_www
+
+        # Guardar preferencia
+        if [[ $include_www =~ ^[Ss]$ ]]; then
+            WWW_PREFERENCES["$DOMAIN"]="yes"
+            info "  → Se solicitará certificado para: $DOMAIN y www.$DOMAIN"
+        else
+            WWW_PREFERENCES["$DOMAIN"]="no"
+            info "  → Se solicitará certificado solo para: $DOMAIN"
+        fi
+        echo ""
+
         # Probar conectividad HTTP primero (check más tolerante)
         log "  Verificando que $DOMAIN es accesible vía HTTP..."
 
@@ -520,10 +541,36 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
             fi
         fi
 
-        # Obtener certificado - IMPORTANTE: usar --entrypoint certbot
-        log "  Solicitando certificado SSL para $DOMAIN y www.$DOMAIN..."
+        # Si se incluyó www, verificar también su conectividad
+        if [[ "${WWW_PREFERENCES[$DOMAIN]}" == "yes" ]]; then
+            log "  Verificando que www.$DOMAIN es accesible vía HTTP..."
+            WWW_HTTP_CHECK=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://www.$DOMAIN" 2>/dev/null || echo "000")
+
+            if [ "$WWW_HTTP_CHECK" != "000" ]; then
+                success "  ✓ www.$DOMAIN accesible vía HTTP (código: $WWW_HTTP_CHECK)"
+            else
+                warning "  ⚠ No se pudo conectar a www.$DOMAIN"
+                warning "  La validación de Let's Encrypt fallará si continúas"
+                read -p "  ¿Continuar de todos modos? (s/n): " continue_www
+                if [[ ! $continue_www =~ ^[Ss]$ ]]; then
+                    warning "  Cambiando a certificado solo para $DOMAIN (sin www)"
+                    WWW_PREFERENCES["$DOMAIN"]="no"
+                fi
+            fi
+        fi
+
+        # Construir comando de certbot según la preferencia
+        if [[ "${WWW_PREFERENCES[$DOMAIN]}" == "yes" ]]; then
+            log "  Solicitando certificado SSL para $DOMAIN y www.$DOMAIN..."
+            DOMAIN_PARAMS="-d $DOMAIN -d www.$DOMAIN"
+        else
+            log "  Solicitando certificado SSL solo para $DOMAIN..."
+            DOMAIN_PARAMS="-d $DOMAIN"
+        fi
+
         echo "  (Esto puede tardar 1-2 minutos...)"
 
+        # Obtener certificado con los parámetros adecuados
         if docker compose run --rm --entrypoint certbot certbot certonly \
             --webroot \
             --webroot-path=/var/www/certbot \
@@ -531,12 +578,15 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
             --agree-tos \
             --no-eff-email \
             --force-renewal \
-            -d "$DOMAIN" \
-            -d "www.$DOMAIN" 2>&1 | tee /tmp/certbot_${DOMAIN}.log; then
+            $DOMAIN_PARAMS 2>&1 | tee /tmp/certbot_${DOMAIN}.log; then
 
             # Verificar que el certificado se creó correctamente
             if [ -d "certbot/conf/live/$DOMAIN" ] && [ -f "certbot/conf/live/$DOMAIN/fullchain.pem" ]; then
-                success "  ✓ Certificado obtenido exitosamente para $DOMAIN"
+                if [[ "${WWW_PREFERENCES[$DOMAIN]}" == "yes" ]]; then
+                    success "  ✓ Certificado obtenido exitosamente para $DOMAIN y www.$DOMAIN"
+                else
+                    success "  ✓ Certificado obtenido exitosamente para $DOMAIN"
+                fi
                 SUCCESSFUL_CERTS+=("$DOMAIN")
             else
                 warning "  ✗ El proceso terminó pero no se encontró el certificado"
@@ -547,6 +597,9 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
             warning "  ✗ Error al obtener certificado para $DOMAIN"
             warning "  Causas comunes:"
             echo "    - DNS no apunta a $SERVER_IP"
+            if [[ "${WWW_PREFERENCES[$DOMAIN]}" == "yes" ]]; then
+                echo "    - DNS de www.$DOMAIN no configurado correctamente"
+            fi
             echo "    - Puerto 80 bloqueado"
             echo "    - Nginx no está funcionando correctamente"
             warning "  Revisa el log: /tmp/certbot_${DOMAIN}.log"
@@ -566,7 +619,11 @@ if [ "$SKIP_CERT_GENERATION" = false ]; then
     if [ ${#SUCCESSFUL_CERTS[@]} -gt 0 ]; then
         success "Certificados exitosos (${#SUCCESSFUL_CERTS[@]}):"
         for domain in "${SUCCESSFUL_CERTS[@]}"; do
-            echo "  ✓ $domain"
+            if [[ "${WWW_PREFERENCES[$domain]}" == "yes" ]]; then
+                echo "  ✓ $domain (incluye www.$domain)"
+            else
+                echo "  ✓ $domain (sin www)"
+            fi
         done
         echo ""
     fi
@@ -815,7 +872,11 @@ echo ""
 success "Certificados SSL instalados y activos:"
 for DOMAIN in "${SUCCESSFUL_CERTS[@]}"; do
     echo "  ✓ https://$DOMAIN"
-    echo "  ✓ https://www.$DOMAIN"
+
+    # Mostrar www solo si se incluyó en el certificado
+    if [[ "${WWW_PREFERENCES[$DOMAIN]}" == "yes" ]]; then
+        echo "  ✓ https://www.$DOMAIN"
+    fi
 
     # Mostrar expiración
     if [ -f "certbot/conf/live/$DOMAIN/cert.pem" ]; then

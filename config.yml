@@ -1,0 +1,40 @@
+# Configuración de WordPress Multi-Site
+# 12 sitios WordPress en guaman.net
+# Modo desatendido - instalación completamente automática
+
+server:
+  # Versión de IP a utilizar
+  # Opciones: ipv4, ipv6, both (o dual)
+  ip_version: "ipv4"
+
+  # IP específica (opcional - dejar vacío para auto-detectar)
+  # Si tienes una IP fija, colócala aquí:
+  #   ip_address: "203.0.113.10"        # Ejemplo IPv4
+  #   ip_address: "2001:db8::1"         # Ejemplo IPv6
+  ip_address: "51.178.80.224"
+
+# Lista de 12 subdominios WordPress
+domains:
+  - angel.guaman.net
+  - ww1.guaman.net
+  - ww2.guaman.net
+  - ww3.guaman.net
+  - ww4.guaman.net
+  - ww5.guaman.net
+  - ww6.guaman.net
+  - ww7.guaman.net
+  - ww8.guaman.net
+  - ww9.guaman.net
+  - w10.guaman.net
+  - w11.guaman.net
+  - w12.guaman.net
+  - leonardo.guaman.net
+
+# Opciones de instalación
+options:
+  # Backup automático diario a las 2:00 AM
+  setup_cron: true
+
+  # Monitoreo en tiempo real con Netdata
+  # Acceso por túnel SSH: ssh -L 19999:localhost:19999 root@IP
+  install_netdata: true
