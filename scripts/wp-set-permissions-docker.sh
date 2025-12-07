@@ -1,9 +1,9 @@
 #!/bin/bash
 
 ###########################################
-# WordPress Security Permissions Script v2
-# Versión adaptada para contenedores Docker
-# Con soporte para múltiples sitios
+# WordPress Security Permissions Script v3
+# Compatible con SFTP (atmoz/sftp)
+# Permisos híbridos: seguro + funcional
 ###########################################
 
 set -euo pipefail
@@ -21,6 +21,9 @@ CONTAINER_NAME="php"
 WP_PATH_CONTAINER="/var/www/html"
 WEB_USER="www-data"
 WEB_GROUP="www-data"
+# UID/GID para compatibilidad con SFTP (atmoz/sftp usa 33:33)
+SFTP_UID="33"
+SFTP_GID="33"
 
 ###########################################
 # Funciones auxiliares
@@ -52,26 +55,48 @@ show_usage() {
     cat << EOF
 Uso: $0 [opciones]
 
+Script de seguridad WordPress compatible con SFTP.
+Aplica permisos híbridos: estrictos en core, permisivos en wp-content.
+
 Opciones:
-    --container Nombre o ID del contenedor (default: php)
-    --path      Ruta dentro del contenedor (default: /var/www/html)
-    --user      Usuario del servidor web (default: www-data)
-    --group     Grupo del servidor web (default: www-data)
-    --help      Muestra esta ayuda
+    --container  Nombre del contenedor PHP (default: php)
+    --path       Ruta dentro del contenedor (default: /var/www/html)
+    --user       Usuario web (default: www-data)
+    --group      Grupo web (default: www-data)
+    --sftp-uid   UID del usuario SFTP (default: 33)
+    --sftp-gid   GID del usuario SFTP (default: 33)
+    --strict     Modo estricto (sin compatibilidad SFTP)
+    --help       Muestra esta ayuda
 
 Ejemplos:
-    # Securizar un sitio específico
-    $0 --path /var/www/html/manidec_com
+    # Securizar un sitio (compatible con SFTP)
+    $0 --path /var/www/html/angel_guaman_net
 
-    # Securizar toda la instalación
+    # Securizar sin compatibilidad SFTP (máxima seguridad)
+    $0 --path /var/www/html/angel_guaman_net --strict
+
+    # Securizar todos los sitios
     $0 --path /var/www/html
 
-    # Con contenedor personalizado
-    $0 --container mi-php --path /var/www/html/aiconvolution_com
+Permisos aplicados:
+    ┌─────────────────────────┬────────────┬─────────────┐
+    │ Ubicación               │ Normal     │ --strict    │
+    ├─────────────────────────┼────────────┼─────────────┤
+    │ wp-admin/               │ 755/644    │ 755/644     │
+    │ wp-includes/            │ 755/644    │ 755/644     │
+    │ Archivos raíz (*.php)   │ 644        │ 644         │
+    │ wp-config.php           │ 440        │ 440         │
+    │ wp-content/             │ 775/664    │ 755/644     │
+    │ wp-content/uploads/     │ 775/664    │ 755/644     │
+    │ wp-content/plugins/     │ 775/664    │ 755/644     │
+    │ wp-content/themes/      │ 775/664    │ 755/644     │
+    └─────────────────────────┴────────────┴─────────────┘
 
 EOF
     exit 1
 }
+
+STRICT_MODE=false
 
 list_wordpress_sites() {
     print_info "Buscando sitios WordPress en el contenedor..."
@@ -118,14 +143,12 @@ check_container() {
 validate_wordpress() {
     print_info "Validando ruta: $WP_PATH_CONTAINER"
 
-    # Verificar si la ruta existe
     if ! docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER" 2>/dev/null; then
         print_error "La ruta '$WP_PATH_CONTAINER' no existe dentro del contenedor"
         list_wordpress_sites
         exit 1
     fi
 
-    # Verificar si es una instalación de WordPress
     local has_wpconfig=$(docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/wp-config.php" && echo "yes" || echo "no")
     local has_wpcontent=$(docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content" && echo "yes" || echo "no")
     local has_wpsettings=$(docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/wp-settings.php" && echo "yes" || echo "no")
@@ -149,9 +172,9 @@ analyze_current_state() {
     print_header "ANÁLISIS DEL ESTADO ACTUAL"
 
     print_info "Sitio: $WP_PATH_CONTAINER"
+    print_info "Modo: $([[ $STRICT_MODE == true ]] && echo 'ESTRICTO (sin SFTP)' || echo 'NORMAL (compatible SFTP)')"
     print_info "Analizando permisos actuales..."
 
-    # Verificar archivos críticos
     echo ""
     print_info "═══ ARCHIVOS CRÍTICOS ═══"
 
@@ -162,7 +185,6 @@ analyze_current_state() {
         fi
     done
 
-    # Verificar directorios principales
     echo ""
     print_info "═══ DIRECTORIOS PRINCIPALES ═══"
 
@@ -173,7 +195,6 @@ analyze_current_state() {
         fi
     done
 
-    # Buscar problemas de seguridad
     echo ""
     print_info "Buscando problemas de seguridad..."
 
@@ -192,7 +213,6 @@ analyze_current_state() {
         print_success "No hay directorios con permisos 777"
     fi
 
-    # Verificar wp-config.php
     if docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null; then
         local wpconfig_perms=$(docker exec "$CONTAINER_NAME" stat -c "%a" "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null)
         echo ""
@@ -205,40 +225,50 @@ analyze_current_state() {
         fi
     fi
 
-    # Verificar propietario
     echo ""
     local current_owner=$(docker exec "$CONTAINER_NAME" stat -c "%U:%G" "$WP_PATH_CONTAINER" 2>/dev/null || echo "desconocido")
     print_info "Propietario actual: $current_owner"
-
-    if [[ "$current_owner" != "$WEB_USER:$WEB_GROUP" ]]; then
-        print_warning "  → Se cambiará a: $WEB_USER:$WEB_GROUP"
-    else
-        print_success "  → Propietario correcto"
-    fi
 }
 
 ###########################################
-# Aplicar securización
+# Aplicar securización HÍBRIDA
 ###########################################
 
 apply_security() {
     print_header "APLICANDO SECURIZACIÓN"
 
-    print_info "Los siguientes cambios serán aplicados:"
-    echo ""
-    echo "  📂 SITIO: $WP_PATH_CONTAINER"
-    echo ""
-    echo "  🔒 PERMISOS:"
-    echo "     • Directorios: 755 (rwxr-xr-x)"
-    echo "     • Archivos: 644 (rw-r--r--)"
-    echo "     • wp-config.php: 440 (r--r-----)"
-    echo ""
-    echo "  👤 PROPIETARIO:"
-    echo "     • Usuario: $WEB_USER"
-    echo "     • Grupo: $WEB_GROUP"
-    echo ""
-    echo "  📁 EXCEPCIONES:"
-    echo "     • wp-content/uploads mantendrá capacidad de escritura"
+    if [[ $STRICT_MODE == true ]]; then
+        print_warning "MODO ESTRICTO: SFTP no podrá escribir en wp-content"
+        echo ""
+        echo "  📂 SITIO: $WP_PATH_CONTAINER"
+        echo ""
+        echo "  🔒 PERMISOS (máxima seguridad):"
+        echo "     • Todos los directorios: 755"
+        echo "     • Todos los archivos: 644"
+        echo "     • wp-config.php: 440"
+        echo ""
+    else
+        print_info "MODO NORMAL: Compatible con SFTP"
+        echo ""
+        echo "  📂 SITIO: $WP_PATH_CONTAINER"
+        echo ""
+        echo "  🔒 PERMISOS HÍBRIDOS:"
+        echo ""
+        echo "     CORE (solo lectura - máxima seguridad):"
+        echo "     • wp-admin/: 755/644"
+        echo "     • wp-includes/: 755/644"
+        echo "     • Archivos raíz: 644"
+        echo "     • wp-config.php: 440"
+        echo ""
+        echo "     CONTENIDO (escritura habilitada - SFTP compatible):"
+        echo "     • wp-content/: 775/664"
+        echo "     • wp-content/uploads/: 775/664"
+        echo "     • wp-content/plugins/: 775/664"
+        echo "     • wp-content/themes/: 775/664"
+        echo ""
+    fi
+
+    echo "  👤 PROPIETARIO: $SFTP_UID:$SFTP_GID (compatible con SFTP)"
     echo ""
 
     read -p "¿Continuar con la securización? (escribe 'SI' para confirmar): " confirm
@@ -252,52 +282,78 @@ apply_security() {
     print_info "Iniciando securización..."
     echo ""
 
-    # 1. Cambiar propietario
-    print_info "[1/6] Cambiando propietario a $WEB_USER:$WEB_GROUP..."
-    if docker exec "$CONTAINER_NAME" chown -R "$WEB_USER":"$WEB_GROUP" "$WP_PATH_CONTAINER" 2>/dev/null; then
-        print_success "Propietario actualizado"
-    else
-        print_warning "No se pudo cambiar el propietario (puede ser normal en algunos contenedores)"
-    fi
+    # 1. Cambiar propietario a UID:GID numérico (compatible con SFTP)
+    print_info "[1/8] Cambiando propietario a $SFTP_UID:$SFTP_GID..."
+    docker exec "$CONTAINER_NAME" chown -R "$SFTP_UID":"$SFTP_GID" "$WP_PATH_CONTAINER" 2>/dev/null && \
+        print_success "Propietario actualizado" || \
+        print_warning "No se pudo cambiar el propietario"
 
-    # 2. Permisos para directorios
-    print_info "[2/6] Estableciendo permisos 755 para directorios..."
+    # 2. Permisos base para TODOS los directorios (755)
+    print_info "[2/8] Estableciendo permisos 755 para todos los directorios..."
     docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -type d -exec chmod 755 {} + 2>/dev/null" && \
-        print_success "Permisos de directorios actualizados"
+        print_success "Permisos de directorios base establecidos"
 
-    # 3. Permisos para archivos
-    print_info "[3/6] Estableciendo permisos 644 para archivos..."
+    # 3. Permisos base para TODOS los archivos (644)
+    print_info "[3/8] Estableciendo permisos 644 para todos los archivos..."
     docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -type f -exec chmod 644 {} + 2>/dev/null" && \
-        print_success "Permisos de archivos actualizados"
+        print_success "Permisos de archivos base establecidos"
 
-    # 4. Securizar wp-config.php
+    # 4. Securizar wp-config.php (siempre estricto)
     if docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null; then
-        print_info "[4/6] Securizando wp-config.php (440)..."
+        print_info "[4/8] Securizando wp-config.php (440)..."
         docker exec "$CONTAINER_NAME" chmod 440 "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null && \
-            print_success "wp-config.php securizado"
+            print_success "wp-config.php securizado (440)"
     else
-        print_warning "[4/6] wp-config.php no encontrado"
+        print_warning "[4/8] wp-config.php no encontrado"
     fi
 
     # 5. Securizar .htaccess
     if docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/.htaccess" 2>/dev/null; then
-        print_info "[5/6] Securizando .htaccess (644)..."
+        print_info "[5/8] Securizando .htaccess (644)..."
         docker exec "$CONTAINER_NAME" chmod 644 "$WP_PATH_CONTAINER/.htaccess" 2>/dev/null && \
             print_success ".htaccess securizado"
     else
-        print_info "[5/6] .htaccess no encontrado (normal con Nginx)"
+        print_info "[5/8] .htaccess no encontrado (normal con Nginx)"
     fi
 
-    # 6. Configurar uploads
-    if docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content/uploads" 2>/dev/null; then
-        print_info "[6/6] Configurando wp-content/uploads..."
-        docker exec "$CONTAINER_NAME" sh -c "
-            chmod 755 '$WP_PATH_CONTAINER/wp-content/uploads' 2>/dev/null
-            find '$WP_PATH_CONTAINER/wp-content/uploads' -type d -exec chmod 755 {} + 2>/dev/null
-            find '$WP_PATH_CONTAINER/wp-content/uploads' -type f -exec chmod 644 {} + 2>/dev/null
-        " && print_success "wp-content/uploads configurado"
+    # 6, 7, 8: Aplicar permisos especiales a wp-content (solo si NO es modo estricto)
+    if [[ $STRICT_MODE == false ]]; then
+        # 6. wp-content principal
+        if docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content" 2>/dev/null; then
+            print_info "[6/8] Configurando wp-content/ para SFTP (775/664)..."
+            docker exec "$CONTAINER_NAME" sh -c "
+                chmod 775 '$WP_PATH_CONTAINER/wp-content'
+            " 2>/dev/null && print_success "wp-content/ configurado"
+        fi
+
+        # 7. Subdirectorios de wp-content que necesitan escritura
+        print_info "[7/8] Configurando subdirectorios de wp-content..."
+        for subdir in uploads plugins themes upgrade cache; do
+            if docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content/$subdir" 2>/dev/null; then
+                docker exec "$CONTAINER_NAME" sh -c "
+                    find '$WP_PATH_CONTAINER/wp-content/$subdir' -type d -exec chmod 775 {} + 2>/dev/null
+                    find '$WP_PATH_CONTAINER/wp-content/$subdir' -type f -exec chmod 664 {} + 2>/dev/null
+                " 2>/dev/null
+                print_success "  wp-content/$subdir/ → 775/664"
+            fi
+        done
+
+        # 8. Crear directorios faltantes con permisos correctos
+        print_info "[8/8] Verificando/creando directorios necesarios..."
+        for subdir in uploads plugins themes upgrade; do
+            if ! docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content/$subdir" 2>/dev/null; then
+                docker exec "$CONTAINER_NAME" sh -c "
+                    mkdir -p '$WP_PATH_CONTAINER/wp-content/$subdir'
+                    chown $SFTP_UID:$SFTP_GID '$WP_PATH_CONTAINER/wp-content/$subdir'
+                    chmod 775 '$WP_PATH_CONTAINER/wp-content/$subdir'
+                " 2>/dev/null
+                print_success "  Creado: wp-content/$subdir/"
+            fi
+        done
     else
-        print_info "[6/6] wp-content/uploads no existe"
+        print_info "[6/8] Modo estricto: wp-content mantiene 755/644"
+        print_info "[7/8] Modo estricto: sin permisos especiales"
+        print_info "[8/8] Modo estricto: completado"
     fi
 
     echo ""
@@ -312,21 +368,23 @@ apply_security() {
 verify_security() {
     print_header "VERIFICACIÓN FINAL"
 
-    local final_777_files=$(docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -maxdepth 3 -type f -perm 0777 2>/dev/null | wc -l")
-    local final_777_dirs=$(docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -maxdepth 3 -type d -perm 0777 2>/dev/null | wc -l")
+    # Verificar 777
+    local final_777_files=$(docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -maxdepth 4 -type f -perm 0777 2>/dev/null | wc -l")
+    local final_777_dirs=$(docker exec "$CONTAINER_NAME" sh -c "find '$WP_PATH_CONTAINER' -maxdepth 4 -type d -perm 0777 2>/dev/null | wc -l")
 
     if [[ $final_777_files -eq 0 ]]; then
-        print_success "No quedan archivos con permisos 777"
+        print_success "No hay archivos con permisos 777"
     else
         print_warning "Aún hay $final_777_files archivos con permisos 777"
     fi
 
     if [[ $final_777_dirs -eq 0 ]]; then
-        print_success "No quedan directorios con permisos 777"
+        print_success "No hay directorios con permisos 777"
     else
         print_warning "Aún hay $final_777_dirs directorios con permisos 777"
     fi
 
+    # Verificar wp-config.php
     if docker exec "$CONTAINER_NAME" test -f "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null; then
         local wpconfig_perms=$(docker exec "$CONTAINER_NAME" stat -c "%a" "$WP_PATH_CONTAINER/wp-config.php" 2>/dev/null)
 
@@ -337,11 +395,58 @@ verify_security() {
         fi
     fi
 
-    local final_owner=$(docker exec "$CONTAINER_NAME" stat -c "%U:%G" "$WP_PATH_CONTAINER" 2>/dev/null)
-    if [[ "$final_owner" == "$WEB_USER:$WEB_GROUP" ]]; then
-        print_success "Propietario correcto: $final_owner"
+    # Verificar propietario
+    local final_owner=$(docker exec "$CONTAINER_NAME" stat -c "%u:%g" "$WP_PATH_CONTAINER" 2>/dev/null)
+    if [[ "$final_owner" == "$SFTP_UID:$SFTP_GID" ]]; then
+        print_success "Propietario correcto: $final_owner (compatible SFTP)"
     else
         print_info "Propietario actual: $final_owner"
+    fi
+
+    # Verificar permisos de wp-content (solo si no es modo estricto)
+    if [[ $STRICT_MODE == false ]]; then
+        echo ""
+        print_info "═══ VERIFICACIÓN SFTP ═══"
+
+        if docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content" 2>/dev/null; then
+            local wpcontent_perms=$(docker exec "$CONTAINER_NAME" stat -c "%a" "$WP_PATH_CONTAINER/wp-content" 2>/dev/null)
+            if [[ "$wpcontent_perms" == "775" ]]; then
+                print_success "wp-content/: $wpcontent_perms (SFTP puede escribir)"
+            else
+                print_warning "wp-content/: $wpcontent_perms (SFTP podría tener problemas)"
+            fi
+        fi
+
+        for subdir in uploads plugins themes; do
+            if docker exec "$CONTAINER_NAME" test -d "$WP_PATH_CONTAINER/wp-content/$subdir" 2>/dev/null; then
+                local subdir_perms=$(docker exec "$CONTAINER_NAME" stat -c "%a" "$WP_PATH_CONTAINER/wp-content/$subdir" 2>/dev/null)
+                if [[ "$subdir_perms" == "775" ]]; then
+                    print_success "wp-content/$subdir/: $subdir_perms ✓"
+                else
+                    print_warning "wp-content/$subdir/: $subdir_perms"
+                fi
+            fi
+        done
+    fi
+
+    # Resumen de seguridad
+    echo ""
+    print_info "═══ RESUMEN DE SEGURIDAD ═══"
+
+    echo ""
+    echo "  PROTEGIDO (solo lectura):"
+    echo "    • wp-admin/"
+    echo "    • wp-includes/"
+    echo "    • wp-config.php (440)"
+    echo "    • Archivos PHP raíz"
+
+    if [[ $STRICT_MODE == false ]]; then
+        echo ""
+        echo "  ESCRITURA HABILITADA (SFTP/WordPress):"
+        echo "    • wp-content/uploads/"
+        echo "    • wp-content/plugins/"
+        echo "    • wp-content/themes/"
+        echo "    • wp-content/upgrade/"
     fi
 }
 
@@ -350,7 +455,7 @@ verify_security() {
 ###########################################
 
 main() {
-    print_header "WORDPRESS SECURITY - DOCKER VERSION"
+    print_header "WORDPRESS SECURITY v3 - SFTP COMPATIBLE"
 
     # Parsear argumentos
     while [[ $# -gt 0 ]]; do
@@ -371,6 +476,18 @@ main() {
                 WEB_GROUP="$2"
                 shift 2
                 ;;
+            --sftp-uid)
+                SFTP_UID="$2"
+                shift 2
+                ;;
+            --sftp-gid)
+                SFTP_GID="$2"
+                shift 2
+                ;;
+            --strict)
+                STRICT_MODE=true
+                shift
+                ;;
             --help)
                 show_usage
                 ;;
@@ -381,7 +498,7 @@ main() {
         esac
     done
 
-    # Normalizar path (eliminar / final si existe)
+    # Normalizar path
     WP_PATH_CONTAINER="${WP_PATH_CONTAINER%/}"
 
     # Validaciones
@@ -399,7 +516,14 @@ main() {
     echo ""
     print_info "Sitio: $WP_PATH_CONTAINER"
     print_info "Contenedor: $CONTAINER_NAME"
+    print_info "Modo: $([[ $STRICT_MODE == true ]] && echo 'ESTRICTO' || echo 'SFTP COMPATIBLE')"
     echo ""
+
+    if [[ $STRICT_MODE == false ]]; then
+        print_success "SFTP debería funcionar correctamente en wp-content/"
+        echo ""
+    fi
+
     print_info "📋 Recomendaciones adicionales:"
     echo "  1. Actualiza WordPress, temas y plugins regularmente"
     echo "  2. Usa contraseñas fuertes para todos los usuarios"
