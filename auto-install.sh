@@ -54,6 +54,61 @@ sanitize_domain_name() {
     echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
 }
 
+# Función para instalar yq (versión Go de Mike Farah)
+install_yq() {
+    log "Instalando yq (versión Go de Mike Farah)..."
+
+    # Eliminar versión antigua si existe (la de apt es incompatible)
+    if command -v yq &>/dev/null; then
+        local yq_version
+        yq_version=$(yq --version 2>&1 || echo "")
+        # Si no es la versión de Mike Farah, eliminarla
+        if [[ ! "$yq_version" =~ "github.com/mikefarah/yq" ]]; then
+            warning "Versión incompatible de yq detectada, reemplazando..."
+            apt-get remove -y yq >> "$LOG_FILE" 2>&1 || true
+            rm -f /usr/local/bin/yq 2>/dev/null || true
+            rm -f /usr/bin/yq 2>/dev/null || true
+        else
+            success "✓ yq (versión correcta) ya instalado"
+            return 0
+        fi
+    fi
+
+    # Detectar arquitectura
+    local arch
+    arch=$(dpkg --print-architecture)
+    local yq_arch=""
+
+    case "$arch" in
+        amd64) yq_arch="amd64" ;;
+        arm64) yq_arch="arm64" ;;
+        armhf) yq_arch="arm" ;;
+        i386)  yq_arch="386" ;;
+        *)     error "Arquitectura no soportada: $arch" ;;
+    esac
+
+    # Descargar última versión de yq
+    local yq_url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${yq_arch}"
+
+    if wget -q "$yq_url" -O /usr/local/bin/yq >> "$LOG_FILE" 2>&1; then
+        chmod +x /usr/local/bin/yq
+
+        # Verificar instalación
+        if /usr/local/bin/yq --version >> "$LOG_FILE" 2>&1; then
+            success "✓ yq instalado correctamente"
+            # Asegurar que está en el PATH
+            if [[ ! -L /usr/bin/yq ]]; then
+                ln -sf /usr/local/bin/yq /usr/bin/yq 2>/dev/null || true
+            fi
+            return 0
+        else
+            error "yq se descargó pero no funciona correctamente"
+        fi
+    else
+        error "No se pudo descargar yq desde $yq_url"
+    fi
+}
+
 # Verificar root
 check_root() {
     [[ $EUID -eq 0 ]] || error "Este script debe ejecutarse como root (usa sudo)"
@@ -83,6 +138,9 @@ EOF
         success "✓ Archivo de configuración encontrado: $CONFIG_FILE"
         UNATTENDED_MODE=true
         log "Modo: DESATENDIDO (configuración desde YAML)"
+
+        # Instalar yq si no está disponible o es versión incorrecta (necesario para modo desatendido)
+        install_yq
     else
         info "Archivo de configuración no encontrado: $CONFIG_FILE"
         log "Modo: INTERACTIVO"
@@ -165,9 +223,16 @@ load_config_from_yaml() {
 
     log "Cargando configuración desde $CONFIG_FILE..."
 
-    # Verificar que yq esté instalado
+    # Verificar que yq esté instalado (versión correcta)
     if ! command -v yq &>/dev/null; then
-        error "yq no está instalado. Ejecuta primero: apt-get install -y yq"
+        error "yq no está instalado. Esto no debería ocurrir."
+    fi
+
+    # Verificar que sea la versión correcta
+    local yq_version
+    yq_version=$(yq --version 2>&1 || echo "")
+    if [[ ! "$yq_version" =~ "github.com/mikefarah/yq" ]]; then
+        error "Versión incorrecta de yq. Se requiere la versión Go de Mike Farah."
     fi
 
     # Cargar IP version
@@ -383,9 +448,14 @@ update_system() {
     apt-get install -y -qq \
         apt-transport-https ca-certificates curl gnupg lsb-release \
         software-properties-common git wget unzip pwgen jq ufw cron \
-        apache2-utils openssh-client yq \
+        apache2-utils openssh-client \
         >> "$LOG_FILE" 2>&1 || error "Error al instalar dependencias"
-    success "✓ Dependencias instaladas (incluyendo yq)"
+    success "✓ Dependencias instaladas"
+
+    # Instalar yq si aún no está (para modo interactivo o por si acaso)
+    if ! command -v yq &>/dev/null || [[ ! "$(yq --version 2>&1)" =~ "github.com/mikefarah/yq" ]]; then
+        install_yq
+    fi
 
     echo ""
     sleep 2

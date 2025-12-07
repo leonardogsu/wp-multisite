@@ -4,6 +4,7 @@
 # Script de Setup - Descarga WordPress y configura sitios
 # Versión refactorizada usando plantillas
 # VERSIÓN CORREGIDA - Con nombres basados en dominio
+# REFACTORIZADO - Permisos delegados a install.sh (set_wordpress_permissions)
 ################################################################################
 
 set -euo pipefail
@@ -157,20 +158,13 @@ setup_sites() {
     rm -rf /tmp/wordpress
 }
 
-# Ajustar permisos
-set_permissions() {
-    log "Paso 3: Ajustando permisos..."
-
-    chown -R www-data:www-data www/ 2>/dev/null || chown -R 33:33 www/
-    find www/ -type d -exec chmod 755 {} \;
-    find www/ -type f -exec chmod 644 {} \;
-
-    log "✓ Permisos ajustados"
-}
+# NOTA: La función set_permissions() ha sido ELIMINADA
+# Los permisos se configuran de forma centralizada en install.sh -> set_wordpress_permissions()
+# Esto evita solapamientos y configuraciones redundantes
 
 # Iniciar contenedores Docker
 start_containers() {
-    log "Paso 4: Iniciando contenedores Docker..."
+    log "Paso 3: Iniciando contenedores Docker..."
 
     # Detener si están corriendo
     if docker compose ps -q 2>/dev/null | grep -q .; then
@@ -187,7 +181,7 @@ start_containers() {
 
 # Esperar a MySQL
 wait_for_mysql() {
-    log "Paso 5: Esperando a que MySQL esté listo..."
+    log "Paso 4: Esperando a que MySQL esté listo..."
 
     local max_attempts=90
     local attempt=0
@@ -215,7 +209,7 @@ wait_for_mysql() {
 
 # Verificar bases de datos
 verify_databases() {
-    log "Paso 6: Verificando bases de datos..."
+    log "Paso 5: Verificando bases de datos..."
 
     # Verificar cada base de datos y crear usuarios
     for i in "${!DOMAINS[@]}"; do
@@ -266,7 +260,7 @@ verify_databases() {
 
 # Verificar conexión desde PHP
 verify_php_connection() {
-    log "Paso 7: Verificando conexión desde PHP..."
+    log "Paso 6: Verificando conexión desde PHP..."
 
     for i in "${!DOMAINS[@]}"; do
         local site_num=$((i + 1))
@@ -380,6 +374,10 @@ show_summary() {
     done
     echo ""
 
+    info "NOTA: Los permisos de archivos se configurarán en el siguiente paso"
+    info "      (install.sh -> set_wordpress_permissions)"
+    echo ""
+
     warning "PRÓXIMOS PASOS:"
     echo "  1. Apuntar DNS de dominios a: ${SERVER_IP}"
     echo "  2. Ejecutar: ./scripts/setup-ssl.sh"
@@ -403,7 +401,7 @@ main() {
     load_env
     download_wordpress
     setup_sites
-    set_permissions
+    # ELIMINADO: set_permissions - ahora se hace en install.sh
     start_containers
     wait_for_mysql
     verify_databases

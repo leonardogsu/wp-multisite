@@ -17,18 +17,7 @@ server:
 domains:
   - angel.guaman.net
   - ww1.guaman.net
-  - ww2.guaman.net
-  - ww3.guaman.net
-  - ww4.guaman.net
-  - ww5.guaman.net
-  - ww6.guaman.net
-  - ww7.guaman.net
-  - ww8.guaman.net
-  - ww9.guaman.net
   - w10.guaman.net
-  - w11.guaman.net
-  - w12.guaman.net
-  - leonardo.guaman.net
 
 # Opciones de instalación
 options:
