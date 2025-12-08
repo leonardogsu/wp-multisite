@@ -1053,9 +1053,13 @@ setup_redis() {
             continue
         fi
 
-        # Crear configuración de Redis
-        local redis_config="
+        # Insertar configuración de Redis usando método robusto
+        # Crear archivo temporal con la configuración
+        local temp_config=$(mktemp)
+        cat > "$temp_config" << REDIS_EOF
+
 /* Redis Object Cache Configuration */
+define('WP_REDIS_CLIENT', 'predis');
 define('WP_REDIS_HOST', 'redis');
 define('WP_REDIS_PORT', 6379);
 define('WP_REDIS_PREFIX', '${redis_prefix}');
@@ -1063,14 +1067,34 @@ define('WP_REDIS_DATABASE', 0);
 define('WP_REDIS_TIMEOUT', 1);
 define('WP_REDIS_READ_TIMEOUT', 1);
 define('WP_CACHE', true);
-"
 
-        # Insertar configuración antes de "That's all, stop editing!"
+REDIS_EOF
+
+        # Insertar antes de "That's all, stop editing!" o "require_once ABSPATH"
         if grep -q "That's all, stop editing!" "$wp_config_path"; then
-            sed -i "/That's all, stop editing!/i\\${redis_config}" "$wp_config_path"
+            # Obtener número de línea
+            local line_num=$(grep -n "That's all, stop editing!" "$wp_config_path" | head -1 | cut -d: -f1)
+            # Insertar configuración antes de esa línea
+            head -n $((line_num - 1)) "$wp_config_path" > "${wp_config_path}.new"
+            cat "$temp_config" >> "${wp_config_path}.new"
+            tail -n +${line_num} "$wp_config_path" >> "${wp_config_path}.new"
+            mv "${wp_config_path}.new" "$wp_config_path"
         elif grep -q "require_once ABSPATH" "$wp_config_path"; then
-            sed -i "/require_once ABSPATH/i\\${redis_config}" "$wp_config_path"
+            local line_num=$(grep -n "require_once ABSPATH" "$wp_config_path" | head -1 | cut -d: -f1)
+            head -n $((line_num - 1)) "$wp_config_path" > "${wp_config_path}.new"
+            cat "$temp_config" >> "${wp_config_path}.new"
+            tail -n +${line_num} "$wp_config_path" >> "${wp_config_path}.new"
+            mv "${wp_config_path}.new" "$wp_config_path"
+        else
+            # Si no encuentra ninguno, agregar antes del cierre de PHP o al final
+            cat "$temp_config" >> "$wp_config_path"
         fi
+
+        rm -f "$temp_config"
+
+        # Corregir permisos del archivo
+        chown 82:82 "$wp_config_path"
+        chmod 440 "$wp_config_path"
 
         # Descargar e instalar plugin Redis Object Cache
         docker compose exec -T php sh -c "

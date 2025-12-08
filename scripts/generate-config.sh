@@ -174,7 +174,7 @@ generate_docker_compose() {
         local domain_sanitized=$(sanitize_domain_name "$domain")
         local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
         local password="${!password_var}"
-        sftp_users+="      sftp_${domain_sanitized}:${password}:33:33:${domain_sanitized}"$'\n'
+        sftp_users+="      sftp_${domain_sanitized}:${password}:82:82:${domain_sanitized}"$'\n'
     done
     sftp_users="${sftp_users%$'\n'}"
 
