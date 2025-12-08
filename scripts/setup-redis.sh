@@ -41,16 +41,17 @@ cleanup() {
 # Registrar trap para limpieza
 trap cleanup EXIT
 
+# Funciones de impresión - todas van a stderr para no interferir con capturas de stdout
 print_header() {
-    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo -e "${BLUE}  $1${NC}" >&2
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n" >&2
 }
 
-print_success() { echo -e "${GREEN}✓${NC} $1"; }
-print_error()   { echo -e "${RED}✗${NC} $1"; }
-print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
-print_info()    { echo -e "${BLUE}ℹ${NC} $1"; }
+print_success() { echo -e "${GREEN}✓${NC} $1" >&2; }
+print_error()   { echo -e "${RED}✗${NC} $1" >&2; }
+print_warning() { echo -e "${YELLOW}⚠${NC} $1" >&2; }
+print_info()    { echo -e "${BLUE}ℹ${NC} $1" >&2; }
 
 # Verificar que estamos en el directorio correcto
 check_environment() {
@@ -118,16 +119,16 @@ list_sites() {
     fi
 
     print_info "Sitios WordPress disponibles:"
-    echo ""
+    echo "" >&2
     local i=1
     for site_name in "${SITES[@]}"; do
-        echo "  $i) $site_name"
+        echo "  $i) $site_name" >&2
         ((i++))
     done
 
-    echo ""
-    echo "  a) Todos los sitios"
-    echo ""
+    echo "" >&2
+    echo "  a) Todos los sitios" >&2
+    echo "" >&2
 }
 
 # Configurar Redis para un sitio específico
@@ -214,11 +215,11 @@ REDIS_EOF
     # Descargar e instalar plugin Redis Object Cache
     install_redis_plugin "$site_name" "$site_path"
 
-    # Verificar conexión desde el sitio
+    # Verificar conexión desde el contenedor Redis
     verify_redis_connection
 
-    echo ""
-    print_success "✓ Redis configurado para $site_name"
+    echo "" >&2
+    print_success "Redis configurado para $site_name"
     print_info "  Prefijo: ${redis_prefix}"
     print_info "  Activar plugin en: http://${site_name}/wp-admin/plugins.php"
 
@@ -302,26 +303,19 @@ fix_object_cache_host() {
     return 0
 }
 
-# Verificar conexión Redis
+# Verificar conexión Redis usando redis-cli (más confiable que PHP)
 verify_redis_connection() {
     print_info "Verificando conexión Redis..."
 
+    # Usar redis-cli que es más confiable que depender de extensiones PHP
     local result
-    result=$(docker compose exec -T php php -r '
-        $redis = new Redis();
-        try {
-            $redis->connect("redis", 6379, 1);
-            echo "OK";
-        } catch (Exception $e) {
-            echo "ERROR: " . $e->getMessage();
-        }
-    ' 2>/dev/null) || result="ERROR"
+    result=$(docker compose exec -T redis redis-cli ping 2>/dev/null) || result=""
 
-    if [[ "$result" == "OK" ]]; then
-        print_success "Conexión Redis verificada"
+    if [[ "$result" == *"PONG"* ]]; then
+        print_success "Conexión Redis verificada (PONG)"
         return 0
     else
-        print_warning "No se pudo verificar conexión: $result"
+        print_warning "No se pudo verificar conexión Redis"
         return 1
     fi
 }
@@ -402,7 +396,7 @@ repair_object_cache() {
     # Verificar conexión
     verify_redis_connection
 
-    print_success "✓ object-cache.php reparado para $site_name"
+    print_success "object-cache.php reparado para $site_name"
 
     return 0
 }
@@ -410,7 +404,7 @@ repair_object_cache() {
 # Reparar todos los sitios
 repair_all_object_cache() {
     print_info "Reparando object-cache.php en todos los sitios..."
-    echo ""
+    echo "" >&2
 
     get_sites
 
@@ -428,7 +422,7 @@ repair_all_object_cache() {
         else
             ((fail_count++))
         fi
-        echo ""
+        echo "" >&2
     done
 
     print_header "RESUMEN DE REPARACIÓN"
@@ -444,15 +438,15 @@ check_redis_status() {
 
     # Info del servidor Redis
     print_info "Servidor Redis:"
-    docker compose exec -T redis redis-cli INFO server 2>/dev/null | grep -E "^(redis_version|uptime_in_seconds|connected_clients)" | sed 's/^/  /'
+    docker compose exec -T redis redis-cli INFO server 2>/dev/null | grep -E "^(redis_version|uptime_in_seconds|connected_clients)" | sed 's/^/  /' >&2
 
-    echo ""
+    echo "" >&2
     print_info "Memoria Redis:"
-    docker compose exec -T redis redis-cli INFO memory 2>/dev/null | grep -E "^(used_memory_human|maxmemory_human)" | sed 's/^/  /'
+    docker compose exec -T redis redis-cli INFO memory 2>/dev/null | grep -E "^(used_memory_human|maxmemory_human)" | sed 's/^/  /' >&2
 
-    echo ""
+    echo "" >&2
     print_info "Estadísticas:"
-    docker compose exec -T redis redis-cli INFO stats 2>/dev/null | grep -E "^(keyspace_hits|keyspace_misses)" | sed 's/^/  /'
+    docker compose exec -T redis redis-cli INFO stats 2>/dev/null | grep -E "^(keyspace_hits|keyspace_misses)" | sed 's/^/  /' >&2
 
     # Calcular hit rate
     local hits
@@ -463,30 +457,30 @@ check_redis_status() {
     if [[ -n "${hits:-}" && -n "${misses:-}" && $((hits + misses)) -gt 0 ]]; then
         local hit_rate
         hit_rate=$(echo "scale=2; $hits * 100 / ($hits + $misses)" | bc 2>/dev/null || echo "N/A")
-        echo "  hit_rate: ${hit_rate}%"
+        echo "  hit_rate: ${hit_rate}%" >&2
     fi
 
-    echo ""
+    echo "" >&2
     print_info "Keys por sitio:"
     docker compose exec -T redis sh -c '
         redis-cli --scan --pattern "*_*" 2>/dev/null | cut -d"_" -f1 | sort | uniq -c
-    ' 2>/dev/null | sed 's/^/  /' || echo "  (sin datos)"
+    ' 2>/dev/null | sed 's/^/  /' >&2 || echo "  (sin datos)" >&2
 
-    echo ""
+    echo "" >&2
     print_info "Estado de object-cache.php por sitio:"
     get_sites
     for site_name in "${SITES[@]}"; do
         local oc_path="$INSTALL_DIR/www/$site_name/wp-content/object-cache.php"
         if [[ -f "$oc_path" ]]; then
             if grep -q "'host' => 'redis'" "$oc_path" 2>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} $site_name - object-cache.php OK (host=redis)"
+                echo -e "  ${GREEN}✓${NC} $site_name - object-cache.php OK (host=redis)" >&2
             else
                 local current_host
                 current_host=$(grep -oP "'host' => '\K[^']+" "$oc_path" 2>/dev/null || echo "desconocido")
-                echo -e "  ${YELLOW}⚠${NC} $site_name - object-cache.php host incorrecto ($current_host)"
+                echo -e "  ${YELLOW}⚠${NC} $site_name - object-cache.php host incorrecto ($current_host)" >&2
             fi
         else
-            echo -e "  ${RED}✗${NC} $site_name - object-cache.php NO EXISTE"
+            echo -e "  ${RED}✗${NC} $site_name - object-cache.php NO EXISTE" >&2
         fi
     done
 }
@@ -526,7 +520,7 @@ flush_redis() {
 
 # Mostrar uso
 show_usage() {
-    cat << EOF
+    cat << EOF >&2
 Uso: $0 [comando] [opciones]
 
 Comandos:
@@ -558,6 +552,7 @@ EOF
 
 # Seleccionar sitio interactivamente
 select_site() {
+    # Mostrar lista de sitios (va a stderr para que no se capture)
     list_sites || return 1
 
     read -p "Selecciona sitio (nombre o número): " site_input
@@ -569,10 +564,12 @@ select_site() {
             print_error "Índice fuera de rango"
             return 1
         fi
+        # Solo esto va a stdout para ser capturado
         echo "${SITES[$idx]}"
     else
         # Validar que el sitio existe
         if validate_site "$site_input"; then
+            # Solo esto va a stdout para ser capturado
             echo "$site_input"
         else
             print_error "Sitio no encontrado: $site_input"
@@ -606,7 +603,7 @@ main() {
         install-all)
             check_environment
             print_info "Instalando Redis en todos los sitios..."
-            echo ""
+            echo "" >&2
 
             get_sites
             if ((${#SITES[@]} == 0)); then
@@ -616,10 +613,10 @@ main() {
 
             for site_name in "${SITES[@]}"; do
                 configure_redis_for_site "$site_name"
-                echo ""
+                echo "" >&2
             done
 
-            print_header "✓ COMPLETADO"
+            print_header "COMPLETADO"
             print_success "Redis configurado en todos los sitios"
             ;;
 
@@ -658,17 +655,17 @@ main() {
         *)
             # Modo interactivo
             check_environment
-            echo ""
-            echo "¿Qué deseas hacer?"
-            echo ""
-            echo "  1) Instalar Redis en un sitio"
-            echo "  2) Instalar Redis en todos los sitios"
-            echo "  3) Reparar object-cache.php en un sitio"
-            echo "  4) Reparar object-cache.php en todos los sitios"
-            echo "  5) Ver estado de Redis"
-            echo "  6) Limpiar caché"
-            echo "  7) Salir"
-            echo ""
+            echo "" >&2
+            echo "¿Qué deseas hacer?" >&2
+            echo "" >&2
+            echo "  1) Instalar Redis en un sitio" >&2
+            echo "  2) Instalar Redis en todos los sitios" >&2
+            echo "  3) Reparar object-cache.php en un sitio" >&2
+            echo "  4) Reparar object-cache.php en todos los sitios" >&2
+            echo "  5) Ver estado de Redis" >&2
+            echo "  6) Limpiar caché" >&2
+            echo "  7) Salir" >&2
+            echo "" >&2
             read -p "Opción: " option
 
             case "$option" in
