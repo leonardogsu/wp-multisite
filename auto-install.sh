@@ -6,6 +6,7 @@
 # Para Ubuntu 24.04 LTS
 # VERSIÓN ACTUALIZADA - SFTP + NETDATA + Nombres basados en dominio
 # + IPv4/IPv6 selection + YAML configuration
+# + Redis y Cookies unificadas
 ################################################################################
 
 set -euo pipefail
@@ -1115,7 +1116,7 @@ REDIS_EOF
 
             # Copiar object-cache.php drop-in
             if [ -f 'wp-content/plugins/redis-cache/includes/object-cache.php' ]; then
-                cp wp-content/plugins/redis-cache/includes/object-cache.php ../object-cache.php 2>/dev/null
+                cp wp-content/plugins/redis-cache/includes/object-cache.php wp-content/object-cache.php 2>/dev/null
             fi
         " >> "$LOG_FILE" 2>&1 || warning "No se pudo instalar plugin automáticamente para ${domain}"
 
@@ -1137,6 +1138,111 @@ REDIS_EOF
     sleep 2
 }
 
+# Configurar Redis y Cookies de forma unificada y robusta
+configure_redis_and_cookies() {
+    if [[ $INSTALL_REDIS != true ]]; then
+        return 0
+    fi
+
+    banner "═══════════════════════════════════════════════════════════════════════"
+    banner "  PASO 13B: Configuración unificada de Redis y Cookies"
+    banner "═══════════════════════════════════════════════════════════════════════"
+    echo ""
+
+    log "Aplicando configuración unificada de Redis y Cookies..."
+    cd "$INSTALL_DIR"
+
+    for dir in www/*/; do
+        local site_name=$(basename "$dir")
+        local wp_config="${dir}wp-config.php"
+
+        [[ ! -f "$wp_config" ]] && continue
+
+        echo ""
+        info "=== Procesando: $site_name ==="
+
+        # Generar hash único
+        local cookie_hash=$(echo -n "$site_name" | md5sum | cut -c1-8)
+        local site_domain=$(echo "$site_name" | sed 's/_/./g')
+
+        # Eliminar TODA configuración anterior de Redis y Cookies (esté donde esté)
+        log "Limpiando configuración anterior..."
+        sed -i '/WP_REDIS_/d' "$wp_config"
+        sed -i '/WP_CACHE/d' "$wp_config"
+        sed -i '/COOKIEHASH/d' "$wp_config"
+        sed -i '/COOKIE_DOMAIN/d' "$wp_config"
+        sed -i '/COOKIEPATH/d' "$wp_config"
+        sed -i '/SITECOOKIEPATH/d' "$wp_config"
+        sed -i '/ADMIN_COOKIE_PATH/d' "$wp_config"
+        sed -i '/PLUGINS_COOKIE_PATH/d' "$wp_config"
+        sed -i '/USER_COOKIE/d' "$wp_config"
+        sed -i '/PASS_COOKIE/d' "$wp_config"
+        sed -i '/AUTH_COOKIE/d' "$wp_config"
+        sed -i '/SECURE_AUTH_COOKIE/d' "$wp_config"
+        sed -i '/LOGGED_IN_COOKIE/d' "$wp_config"
+        sed -i '/TEST_COOKIE/d' "$wp_config"
+        sed -i '/Redis Object Cache/d' "$wp_config"
+        sed -i '/Cookie Configuration/d' "$wp_config"
+
+        # Eliminar líneas vacías múltiples al final
+        sed -i ':a;/^[[:space:]]*$/{$d;N;ba}' "$wp_config"
+
+        # Crear configuración completa
+        local config_content=$(cat << CONFIGEOF
+
+/* Redis Object Cache Configuration */
+define('WP_REDIS_CLIENT', 'predis');
+define('WP_REDIS_HOST', 'redis');
+define('WP_REDIS_PORT', 6379);
+define('WP_REDIS_PREFIX', '${site_name}_');
+define('WP_REDIS_DATABASE', 0);
+define('WP_REDIS_TIMEOUT', 1);
+define('WP_REDIS_READ_TIMEOUT', 1);
+define('WP_CACHE', true);
+
+/* Cookie Configuration - Unique for ${site_name} */
+define('COOKIE_DOMAIN', '${site_domain}');
+define('COOKIEPATH', '/');
+define('SITECOOKIEPATH', '/');
+define('ADMIN_COOKIE_PATH', '/wp-admin');
+define('PLUGINS_COOKIE_PATH', '/wp-content/plugins');
+define('COOKIEHASH', '${cookie_hash}');
+define('USER_COOKIE', 'wpuser_${cookie_hash}');
+define('PASS_COOKIE', 'wppass_${cookie_hash}');
+define('AUTH_COOKIE', 'wpauth_${cookie_hash}');
+define('SECURE_AUTH_COOKIE', 'wpsecauth_${cookie_hash}');
+define('LOGGED_IN_COOKIE', 'wplogin_${cookie_hash}');
+define('TEST_COOKIE', 'wptest_${cookie_hash}');
+
+CONFIGEOF
+)
+
+        # Insertar ANTES de "if ( !defined('ABSPATH') )"
+        if grep -q "if ( !defined('ABSPATH') )" "$wp_config"; then
+            local line_num=$(grep -n "if ( !defined('ABSPATH') )" "$wp_config" | head -1 | cut -d: -f1)
+            head -n $((line_num - 1)) "$wp_config" > "${wp_config}.new"
+            echo "$config_content" >> "${wp_config}.new"
+            tail -n +${line_num} "$wp_config" >> "${wp_config}.new"
+            mv "${wp_config}.new" "$wp_config"
+            success "  ✓ Configuración insertada antes de ABSPATH"
+        else
+            warning "  ✗ No se encontró la línea ABSPATH, insertando al final"
+            echo "$config_content" >> "$wp_config"
+        fi
+
+        chown 82:82 "$wp_config"
+        chmod 440 "$wp_config"
+
+        success "  ✓ Cookie hash: $cookie_hash"
+        success "  ✓ Domain: $site_domain"
+    done
+
+    echo ""
+    success "✓ Configuración unificada de Redis y Cookies completada"
+    echo ""
+    sleep 2
+}
+
 # Configurar backup automático
 configure_backup() {
     if [[ $SETUP_CRON != true ]]; then
@@ -1144,7 +1250,7 @@ configure_backup() {
     fi
 
     banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 13: Configuración de backup automático"
+    banner "  PASO 14: Configuración de backup automático"
     banner "═══════════════════════════════════════════════════════════════════════"
     echo ""
 
@@ -1321,6 +1427,7 @@ main() {
     setup_wordpress
     set_wordpress_permissions
     setup_redis
+    configure_redis_and_cookies  # ← NUEVA FUNCIÓN: Configuración unificada
     configure_backup
     show_final_summary
 }
