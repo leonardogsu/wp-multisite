@@ -53,20 +53,20 @@ info()    { _log "INFO" "$BLUE" "$@"; }
 success() { _log "OK" "$GREEN" "✓ $*"; }
 banner()  { echo -e "${CYAN}$*${NC}" | tee -a "$LOG_FILE"; }
 
-# Sanitizar dominio con caché
-get_sanitized_domain() {
+# Sanitizar dominio con caché (SIN subshell)
+sanitize_domain() {
     local domain="$1"
-    # Usar caché si existe
-    if [[ -n "${DOMAIN_SANITIZED[$domain]:-}" ]]; then
-        echo "${DOMAIN_SANITIZED[$domain]}"
-        return
-    fi
-    # Calcular y cachear (bash puro, sin tr/sed externos)
     local sanitized="${domain//./_}"
     sanitized="${sanitized//-/_}"
     sanitized="${sanitized//[^a-zA-Z0-9_]/}"
-    DOMAIN_SANITIZED[$domain]="$sanitized"
     echo "$sanitized"
+}
+
+# Pre-poblar caché de dominios sanitizados (llamar después de cargar DOMAINS)
+populate_domain_cache() {
+    for domain in "${DOMAINS[@]}"; do
+        DOMAIN_SANITIZED[$domain]=$(sanitize_domain "$domain")
+    done
 }
 
 # Generar contraseña (bash puro cuando sea posible)
@@ -97,10 +97,9 @@ export_credentials() {
 
     local i=1
     for domain in "${DOMAINS[@]}"; do
-        local sanitized
-        sanitized=$(get_sanitized_domain "$domain")
+        local san="${DOMAIN_SANITIZED[$domain]}"
         export "DB_PASSWORD_$i=${DB_PASSWORDS[$domain]}"
-        export "SFTP_${sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
+        export "SFTP_${san^^}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
         ((i++))
     done
 }
@@ -289,9 +288,7 @@ gather_interactive_input() {
     fi
 
     # Pre-calcular nombres sanitizados
-    for domain in "${DOMAINS[@]}"; do
-        get_sanitized_domain "$domain" > /dev/null
-    done
+    populate_domain_cache
 
     show_config_summary
 }
@@ -452,38 +449,84 @@ generate_all_credentials() {
         SFTP_PASSWORDS[$domain]=$(generate_password 24)
     done
 
-    # Guardar credenciales
+    # ════════════════════════════════════════════════════════════════════
+    # ARCHIVO .credentials (formato legible)
+    # ════════════════════════════════════════════════════════════════════
     local cred_file="$INSTALL_DIR/.credentials"
     {
-        echo "# CREDENCIALES - $(date)"
-        echo "MySQL Root: $MYSQL_ROOT_PASSWORD"
-        echo ""
+        cat << HEADER
+# CREDENCIALES DEL SISTEMA
+# Generadas: $(date)
+# GUARDAR EN LUGAR SEGURO
+
+MySQL Root Password: $MYSQL_ROOT_PASSWORD
+
+# Credenciales por sitio
+HEADER
+
         for domain in "${DOMAINS[@]}"; do
             local san="${DOMAIN_SANITIZED[$domain]}"
-            cat << EOF
-=== $domain ===
-Carpeta: $san
-DB: $san | User: wpuser_$san | Pass: ${DB_PASSWORDS[$domain]}
-SFTP: sftp_$san | Pass: ${SFTP_PASSWORDS[$domain]}
+            cat << SITE
 
-EOF
+=== ${domain} ===
+Carpeta: ${san}
+Base de datos: ${san}
+Usuario DB: wpuser_${san}
+Password DB: ${DB_PASSWORDS[$domain]}
+Usuario SFTP: sftp_${san}
+Password SFTP: ${SFTP_PASSWORDS[$domain]}
+SITE
         done
     } > "$cred_file"
     chmod 600 "$cred_file"
+    chown root:root "$cred_file"
 
-    # Crear .env
+    # ════════════════════════════════════════════════════════════════════
+    # ARCHIVO .env (formato para docker-compose y scripts)
+    # ════════════════════════════════════════════════════════════════════
     {
-        echo "MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD"
-        echo "SERVER_IP=$SERVER_IP"
-        echo "IP_VERSION=$IP_VERSION"
+        cat << ENV_HEADER
+# Variables de entorno
+# Generadas: $(date)
+
+# MySQL
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+
+# Servidor
+SERVER_IP=$SERVER_IP
+IP_VERSION=$IP_VERSION
+
+# Opciones
+INSTALL_PHPMYADMIN=true
+INSTALL_SFTP=true
+
+# Dominios
+ENV_HEADER
+
         local i=1
         for domain in "${DOMAINS[@]}"; do
             echo "DOMAIN_$i=$domain"
+            ((i++))
+        done
+
+        echo ""
+        echo "# Database passwords por sitio"
+        i=1
+        for domain in "${DOMAINS[@]}"; do
             echo "DB_PASSWORD_$i=${DB_PASSWORDS[$domain]}"
             ((i++))
         done
+
+        echo ""
+        echo "# SFTP - Usuarios independientes por sitio"
+        for domain in "${DOMAINS[@]}"; do
+            local san="${DOMAIN_SANITIZED[$domain]}"
+            local san_upper="${san^^}"
+            echo "SFTP_${san_upper}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
+        done
     } > .env
     chmod 600 .env
+    chown root:root .env
 
     export_credentials
     success "Credenciales generadas"
