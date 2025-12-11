@@ -765,7 +765,7 @@ configure_backup() {
     # Configurar cron
     (crontab -l 2>/dev/null | grep -v "backup.sh"; cat << EOF
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 2 * * * cd $INSTALL_DIR && ./scripts/backup.sh >> $INSTALL_DIR/logs/backup.log 2>&1
+0 6 * * * cd $INSTALL_DIR && ./scripts/backup.sh >> $INSTALL_DIR/logs/backup.log 2>&1
 EOF
     ) | crontab -
 

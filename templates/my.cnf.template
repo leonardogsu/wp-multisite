@@ -10,3 +10,6 @@ innodb_flush_method = O_DIRECT
 quick
 quote-names
 max_allowed_packet = 64M
+
+[mysqld]
+skip-log-bin
