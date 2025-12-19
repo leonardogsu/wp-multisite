@@ -20,7 +20,7 @@ Una forma **súper segura** de ver Netdata en tu navegador, cifrando toda la con
 
 #### En Linux/Mac:
 ```bash
-ssh -L 19999:localhost:19999 root@146.59.228.174
+ssh -L 19999:localhost:19999 ubuntu@146.59.228.174
 ```
 
 #### En Windows (PowerShell):

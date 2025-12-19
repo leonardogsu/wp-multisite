@@ -1,277 +1,405 @@
 #!/bin/bash
 
 ################################################################################
-# Script refactorizado para generar configuraciones del proyecto
-# Usa plantillas externas para máxima mantenibilidad
-# VERSIÓN CORREGIDA - Con nombres basados en dominio
+# WordPress Multi-Site - Generador de Configuraciones (REFACTORIZADO)
+# Usa plantillas externas y patrones de eficiencia
+# Armonizado con auto-install-refactored.sh
 ################################################################################
 
 set -euo pipefail
 
-# Configuración
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN Y CONSTANTES
+# ══════════════════════════════════════════════════════════════════════════════
+
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || pwd)"
 readonly TEMPLATE_DIR="${PROJECT_DIR}/templates"
-readonly ENV_FILE=".env"
+readonly ENV_FILE="${PROJECT_DIR}/.env"
 
-# Colores
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m'
+# Colores (con fallback para no-TTY)
+if [[ -t 1 ]]; then
+    readonly RED=$'\e[0;31m' GREEN=$'\e[0;32m' YELLOW=$'\e[1;33m'
+    readonly BLUE=$'\e[0;34m' CYAN=$'\e[0;36m' NC=$'\e[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''
+fi
 
-# Funciones de logging
-log() { echo -e "${GREEN}[$(date +'%H:%M:%S')]${NC} $*"; }
-info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
-warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; }
+# ══════════════════════════════════════════════════════════════════════════════
+# VARIABLES GLOBALES (arrays asociativos para caché)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Función mejorada para sanitizar subdominios
-sanitize_domain_name() {
-    local domain="$1"
-    # Convertir puntos y guiones en guiones bajos, eliminar caracteres especiales
-    # Mantiene la estructura completa del subdominio
-    echo "$domain" | sed 's/\./_/g' | sed 's/-/_/g' | sed 's/[^a-zA-Z0-9_]//g' | tr '[:upper:]' '[:lower:]'
+declare -a DOMAINS=()
+declare -A DOMAIN_CACHE=()       # Caché: domain -> sanitized (renombrado para evitar conflicto con envsubst)
+declare -A SFTP_PASSWORDS=()     # Caché: domain -> password
+declare -A DB_PASSWORDS=()       # Caché: domain -> password
+declare MYSQL_ROOT_PASSWORD="" SERVER_IP=""
+declare PHPMYADMIN_AUTH_USER="" PHPMYADMIN_AUTH_PASSWORD=""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCIONES DE UTILIDAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Logging unificado
+_log() {
+    local level="$1" color="$2" msg="${*:3}"
+    printf '%b[%s][%s]%b %s\n' "$color" "$(date +%T)" "$level" "$NC" "$msg"
 }
-# Verificar requisitos
-check_requirements() {
-    cd "$PROJECT_DIR" || error "No se pudo acceder al directorio del proyecto"
-    [[ -f "$ENV_FILE" ]] || error "Archivo .env no encontrado en $PROJECT_DIR"
-    [[ -d "$TEMPLATE_DIR" ]] || error "Directorio templates/ no encontrado en $TEMPLATE_DIR"
+log()     { _log "INFO" "$GREEN" "$@"; }
+error()   { _log "ERROR" "$RED" "$@"; exit 1; }
+warning() { _log "WARN" "$YELLOW" "$@"; }
+info()    { _log "INFO" "$BLUE" "$@"; }
+success() { _log "OK" "$GREEN" "✓ $*"; }
+banner()  { echo -e "\n${CYAN}$*${NC}"; }
 
-    if ! command -v htpasswd &>/dev/null; then
-        warning "Instalando apache2-utils..."
-        apt-get update -qq && apt-get install -y -qq apache2-utils
+# Sanitizar dominio (bash puro, sin subshell para caché)
+sanitize_domain() {
+    local domain="$1"
+    local sanitized="${domain//./_}"
+    sanitized="${sanitized//-/_}"
+    sanitized="${sanitized//[^a-zA-Z0-9_]/}"
+    echo "${sanitized,,}"  # Lowercase
+}
+
+# Pre-poblar caché de dominios sanitizados
+populate_domain_cache() {
+    for domain in "${DOMAINS[@]}"; do
+        DOMAIN_CACHE[$domain]=$(sanitize_domain "$domain")
+    done
+}
+
+# Generar contraseña
+generate_password() {
+    local length="${1:-24}"
+    if command -v pwgen &>/dev/null; then
+        pwgen -s "$length" 1
+    else
+        head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
     fi
 }
 
-# Cargar variables de entorno
+# Verificar comando existe
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VERIFICACIONES
+# ══════════════════════════════════════════════════════════════════════════════
+
+check_requirements() {
+    cd "$PROJECT_DIR" || error "No se pudo acceder a: $PROJECT_DIR"
+    [[ -f "$ENV_FILE" ]] || error "Archivo .env no encontrado"
+    [[ -d "$TEMPLATE_DIR" ]] || error "Directorio templates/ no encontrado"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: Verificar que los templates necesarios existen
+    # ══════════════════════════════════════════════════════════════════════════
+    local required_templates=(
+        "docker-compose.yml.template"
+        "nginx.conf.template"
+        "vhost-http.conf.template"
+        "vhost-https.conf.template"
+        "phpmyadmin-http.conf.template"
+        "phpmyadmin-https.conf.template"
+        "php.ini.template"
+        "www.conf.template"
+        "my.cnf.template"
+        "wp-config.php.template"
+        "gitignore.template"
+    )
+
+    for template in "${required_templates[@]}"; do
+        if [[ ! -f "${TEMPLATE_DIR}/${template}" ]]; then
+            error "Template faltante: ${TEMPLATE_DIR}/${template}"
+        fi
+    done
+
+    if ! cmd_exists htpasswd; then
+        warning "Instalando apache2-utils..."
+        apt-get update -qq && apt-get install -y -qq apache2-utils
+    fi
+
+    if ! cmd_exists pwgen; then
+        warning "Instalando pwgen..."
+        apt-get install -y -qq pwgen
+    fi
+
+    success "Requisitos verificados"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CARGA DE VARIABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
 load_env() {
-    # Exportar todas las variables del .env
+    log "Cargando variables de entorno..."
+
+    # Exportar variables del .env
     set -a
     source "$ENV_FILE"
     set +a
 
     # Cargar array de dominios
     mapfile -t DOMAINS < <(grep "^DOMAIN_" "$ENV_FILE" | cut -d'=' -f2)
-    readonly DOMAINS
+    [[ ${#DOMAINS[@]} -eq 0 ]] && error "No hay dominios configurados en .env"
+
+    # Pre-poblar caché
+    populate_domain_cache
+
+    # Cargar credenciales existentes a arrays asociativos
+    local i=1
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local san_upper="${san^^}"
+
+        # DB Password
+        local db_pw_var="DB_PASSWORD_$i"
+        [[ -n "${!db_pw_var:-}" ]] && DB_PASSWORDS[$domain]="${!db_pw_var}"
+
+        # SFTP Password
+        local sftp_pw_var="SFTP_${san_upper}_PASSWORD"
+        [[ -n "${!sftp_pw_var:-}" ]] && SFTP_PASSWORDS[$domain]="${!sftp_pw_var}"
+
+        ((i++)) || true  # FIX: Prevenir fallo con set -e cuando i=0
+    done
+
+    success "Variables cargadas: ${#DOMAINS[@]} dominios"
 }
 
-# Setup phpMyAdmin
+# ══════════════════════════════════════════════════════════════════════════════
+# SETUP CREDENCIALES
+# ══════════════════════════════════════════════════════════════════════════════
+
 setup_phpmyadmin_credentials() {
     log "Configurando phpMyAdmin..."
 
+    # Verificar si ya existe
     if ! grep -q "^PHPMYADMIN_AUTH_USER=" "$ENV_FILE" 2>/dev/null; then
-        local user="phpmyadmin"
-        local password
-        password=$(pwgen -s 16 1)
+        PHPMYADMIN_AUTH_USER="phpmyadmin"
+        PHPMYADMIN_AUTH_PASSWORD=$(generate_password 16)
 
         {
             echo ""
             echo "# phpMyAdmin Authentication"
-            echo "PHPMYADMIN_AUTH_USER=$user"
-            echo "PHPMYADMIN_AUTH_PASSWORD=$password"
+            echo "PHPMYADMIN_AUTH_USER=$PHPMYADMIN_AUTH_USER"
+            echo "PHPMYADMIN_AUTH_PASSWORD=$PHPMYADMIN_AUTH_PASSWORD"
         } >> "$ENV_FILE"
 
-        info "  Nuevo usuario: $user / $password"
-
-        # Recargar variables
-        export PHPMYADMIN_AUTH_USER="$user"
-        export PHPMYADMIN_AUTH_PASSWORD="$password"
+        info "Nuevo usuario phpMyAdmin: $PHPMYADMIN_AUTH_USER"
+    else
+        PHPMYADMIN_AUTH_USER=$(grep "^PHPMYADMIN_AUTH_USER=" "$ENV_FILE" | cut -d'=' -f2)
+        PHPMYADMIN_AUTH_PASSWORD=$(grep "^PHPMYADMIN_AUTH_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
     fi
 
-    local user password
-    user="${PHPMYADMIN_AUTH_USER:-$(grep "^PHPMYADMIN_AUTH_USER=" "$ENV_FILE" | cut -d'=' -f2)}"
-    password="${PHPMYADMIN_AUTH_PASSWORD:-$(grep "^PHPMYADMIN_AUTH_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)}"
-
+    # Crear htpasswd
     mkdir -p nginx/auth
-    htpasswd -bc nginx/auth/.htpasswd "$user" "$password"
+    htpasswd -bc nginx/auth/.htpasswd "$PHPMYADMIN_AUTH_USER" "$PHPMYADMIN_AUTH_PASSWORD" 2>/dev/null
     chmod 644 nginx/auth/.htpasswd
 
+    # PMA_ABSOLUTE_URI si no existe
     if ! grep -q "^PMA_ABSOLUTE_URI=" "$ENV_FILE" 2>/dev/null && [[ -n "${DOMAINS[0]:-}" ]]; then
         {
             echo ""
             echo "# phpMyAdmin Configuration"
             echo "PMA_ABSOLUTE_URI=http://${DOMAINS[0]}/phpmyadmin/"
         } >> "$ENV_FILE"
-
-        export PMA_ABSOLUTE_URI="http://${DOMAINS[0]}/phpmyadmin/"
     fi
+
+    success "phpMyAdmin configurado"
 }
 
-# Setup SFTP usuarios independientes
-setup_sftp_credentials() {
-    log "Configurando usuarios SFTP independientes..."
-
-    # Verificar si ya existen credenciales SFTP para el primer dominio
-    local first_domain_sanitized=$(sanitize_domain_name "${DOMAINS[0]}")
-    if ! grep -q "^SFTP_${first_domain_sanitized^^}_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
-        {
-            echo ""
-            echo "# SFTP - Usuarios independientes por sitio"
-        } >> "$ENV_FILE"
-
-        for i in "${!DOMAINS[@]}"; do
-            local domain="${DOMAINS[$i]}"
-            local domain_sanitized=$(sanitize_domain_name "$domain")
-            local password
-            password=$(pwgen -s 24 1)
-            echo "SFTP_${domain_sanitized^^}_PASSWORD=$password" >> "$ENV_FILE"
-            info "  Usuario ${domain}: sftp_${domain_sanitized} / $password"
-        done
-
-        # Recargar .env
-        set -a
-        source "$ENV_FILE"
-        set +a
-    fi
-}
-
-# Setup credenciales de DB por sitio
 setup_db_credentials() {
-    log "Configurando credenciales de base de datos por sitio..."
+    log "Configurando credenciales de base de datos..."
 
-    # Verificar si ya existen credenciales DB
-    if ! grep -q "^DB_PASSWORD_1=" "$ENV_FILE" 2>/dev/null; then
-        {
-            echo ""
-            echo "# Database passwords por sitio"
-        } >> "$ENV_FILE"
-
-        for i in "${!DOMAINS[@]}"; do
-            local site_num=$((i + 1))
-            local password
-            password=$(pwgen -s 24 1)
-            echo "DB_PASSWORD_${site_num}=$password" >> "$ENV_FILE"
-            info "  DB password sitio ${site_num}: $password"
-        done
-
-        # Recargar .env
-        set -a
-        source "$ENV_FILE"
-        set +a
+    if grep -q "^DB_PASSWORD_1=" "$ENV_FILE" 2>/dev/null; then
+        success "Credenciales DB ya existen"
+        return 0
     fi
+
+    {
+        echo ""
+        echo "# Database passwords por sitio"
+    } >> "$ENV_FILE"
+
+    local i=1
+    for domain in "${DOMAINS[@]}"; do
+        local password
+        password=$(generate_password 24)
+        DB_PASSWORDS[$domain]="$password"
+        echo "DB_PASSWORD_$i=$password" >> "$ENV_FILE"
+        ((i++)) || true  # FIX: Prevenir fallo con set -e
+    done
+
+    # Recargar variables
+    set -a; source "$ENV_FILE"; set +a
+
+    success "Credenciales DB generadas"
 }
 
-# Generar docker-compose
+setup_sftp_credentials() {
+    log "Configurando usuarios SFTP..."
+
+    local first_san="${DOMAIN_CACHE[${DOMAINS[0]}]}"
+    if grep -q "^SFTP_${first_san^^}_PASSWORD=" "$ENV_FILE" 2>/dev/null; then
+        success "Credenciales SFTP ya existen"
+        return 0
+    fi
+
+    {
+        echo ""
+        echo "# SFTP - Usuarios independientes por sitio"
+    } >> "$ENV_FILE"
+
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local password
+        password=$(generate_password 24)
+        SFTP_PASSWORDS[$domain]="$password"
+        echo "SFTP_${san^^}_PASSWORD=$password" >> "$ENV_FILE"
+        info "  Usuario: sftp_$san"
+    done
+
+    # Recargar variables
+    set -a; source "$ENV_FILE"; set +a
+
+    success "Credenciales SFTP generadas"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GENERACIÓN DE CONFIGURACIONES
+# ══════════════════════════════════════════════════════════════════════════════
+
 generate_docker_compose() {
     log "Generando docker-compose.yml..."
 
-    # Construir volúmenes SFTP
-    local sftp_volumes=""
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        sftp_volumes+="      - ./www/${domain_sanitized}:/home/sftp_${domain_sanitized}/${domain_sanitized}:rw"$'\n'
-    done
-    sftp_volumes="${sftp_volumes%$'\n'}"
+    # Construir volúmenes y usuarios SFTP
+    local sftp_volumes="" sftp_users=""
 
-    # Construir usuarios SFTP
-    local sftp_users=""
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
-        local password="${!password_var}"
-        sftp_users+="      sftp_${domain_sanitized}:${password}:82:82:${domain_sanitized}"$'\n'
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local password="${SFTP_PASSWORDS[$domain]:-}"
+
+        # Fallback si no está en cache
+        [[ -z "$password" ]] && password=$(grep "^SFTP_${san^^}_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+
+        sftp_volumes+="      - ./www/${san}:/home/sftp_${san}/${san}:rw"$'\n'
+        sftp_users+="      sftp_${san}:${password}:82:82:${san}"$'\n'
     done
+
+    # Eliminar último newline
+    sftp_volumes="${sftp_volumes%$'\n'}"
     sftp_users="${sftp_users%$'\n'}"
 
-    # Asegurar que todas las variables estén exportadas
-    export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    # Usar DB_PASSWORD_1 como DB_PASSWORD para compatibilidad con template docker-compose
-    # (aunque creamos usuarios individuales en setup.sh)
-    export DB_PASSWORD="${DB_PASSWORD_1}"
-    export SERVER_IP="${SERVER_IP}"
+    # Exportar variables para envsubst
+    export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-}"
+    export DB_PASSWORD="${DB_PASSWORDS[${DOMAINS[0]}]:-${DB_PASSWORD_1:-}}"
+    export SERVER_IP="${SERVER_IP:-}"
     export PMA_ABSOLUTE_URI="${PMA_ABSOLUTE_URI:-http://${DOMAINS[0]}/phpmyadmin/}"
     export SFTP_VOLUMES="$sftp_volumes"
     export SFTP_USERS="$sftp_users"
 
-    # Usar envsubst
     envsubst '${MYSQL_ROOT_PASSWORD} ${DB_PASSWORD} ${SERVER_IP} ${PMA_ABSOLUTE_URI} ${SFTP_VOLUMES} ${SFTP_USERS}' \
         < "${TEMPLATE_DIR}/docker-compose.yml.template" > docker-compose.yml
 
-    log "✅ docker-compose.yml generado"
+    success "docker-compose.yml"
 }
 
-# Generar nginx.conf
 generate_nginx_conf() {
     log "Generando nginx.conf..."
     cp "${TEMPLATE_DIR}/nginx.conf.template" nginx/nginx.conf
-    log "✅ nginx.conf generado"
+    success "nginx.conf"
 }
 
-# Generar vhost individual
 generate_vhost() {
     local domain="$1"
     local site_num="$2"
-    local is_first="${3:-false}"
-    local domain_sanitized=$(sanitize_domain_name "$domain")
+    local is_first="$3"
+    local san="${DOMAIN_CACHE[$domain]}"
     local output_file="nginx/conf.d/${domain}.conf"
 
-    log "  → $domain → ${domain_sanitized}"
+    info "  → $domain → $san"
 
-    # Variables para las plantillas
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: Verificar que el directorio de salida existe
+    # ══════════════════════════════════════════════════════════════════════════
+    mkdir -p "$(dirname "$output_file")"
+
+    # Exportar variables para plantillas
     export DOMAIN="$domain"
     export SITE_NUM="$site_num"
-    export DOMAIN_SANITIZED="$domain_sanitized"
-    export DATE="$(date)"
+    export DOMAIN_SANITIZED="$san"
+    export DATE
+    DATE="$(date)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: Verificar existencia del template antes de usarlo
+    # ══════════════════════════════════════════════════════════════════════════
+    local http_template="${TEMPLATE_DIR}/vhost-http.conf.template"
+    local https_template="${TEMPLATE_DIR}/vhost-https.conf.template"
+    local pma_http_template="${TEMPLATE_DIR}/phpmyadmin-http.conf.template"
+    local pma_https_template="${TEMPLATE_DIR}/phpmyadmin-https.conf.template"
+
+    [[ -f "$http_template" ]] || error "Template no encontrado: $http_template"
 
     # Generar bloque HTTP
-    # Primero procesamos las variables de plantilla, luego convertimos $$ a $
-    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' < "${TEMPLATE_DIR}/vhost-http.conf.template" | \
-        sed 's/\$\$/$/g' > "$output_file"
+    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' \
+        < "$http_template" | sed 's/\$\$/$/g' > "$output_file"
 
-    # Añadir phpMyAdmin si es el primer dominio
+    # phpMyAdmin si es primer dominio
     if [[ "$is_first" == "true" ]]; then
-        # phpMyAdmin block no necesita envsubst, solo convertir $$ a $
-        sed 's/\$\$/$/g' "${TEMPLATE_DIR}/phpmyadmin-http.conf.template" >> "$output_file"
+        [[ -f "$pma_http_template" ]] || error "Template no encontrado: $pma_http_template"
+        sed 's/\$\$/$/g' "$pma_http_template" >> "$output_file"
     else
-        # Cerrar el bloque server si NO es el primer dominio
         echo "}" >> "$output_file"
     fi
 
-    # Añadir bloque HTTPS (comentado)
+    # Bloque HTTPS (comentado)
     echo "" >> "$output_file"
-    envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' < "${TEMPLATE_DIR}/vhost-https.conf.template" | \
-        sed 's/\$\$/$/g' >> "$output_file"
+    if [[ -f "$https_template" ]]; then
+        envsubst '${DOMAIN} ${SITE_NUM} ${DOMAIN_SANITIZED} ${DATE}' \
+            < "$https_template" | sed 's/\$\$/$/g' >> "$output_file"
+    fi
 
-    # Añadir phpMyAdmin HTTPS si es el primer dominio
     if [[ "$is_first" == "true" ]]; then
-        sed 's/\$\$/$/g' "${TEMPLATE_DIR}/phpmyadmin-https.conf.template" >> "$output_file"
+        [[ -f "$pma_https_template" ]] && sed 's/\$\$/$/g' "$pma_https_template" >> "$output_file"
     else
-        # Cerrar el bloque server comentado si NO es el primer dominio
         echo "# }" >> "$output_file"
     fi
 
     unset DOMAIN SITE_NUM DOMAIN_SANITIZED DATE
 }
 
-# Generar todos los vhosts
 generate_vhosts() {
     log "Generando virtual hosts..."
 
-    for i in "${!DOMAINS[@]}"; do
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: Usar forma segura de determinar is_first (evita problemas con set -e)
+    # ══════════════════════════════════════════════════════════════════════════
+    local i=0
+    local is_first
+    for domain in "${DOMAINS[@]}"; do
         local site_num=$((i + 1))
-        local is_first=false
-        [[ $i -eq 0 ]] && is_first=true
 
-        generate_vhost "${DOMAINS[$i]}" "$site_num" "$is_first"
+        # FIX: Forma segura que no falla con set -e
+        if [[ $i -eq 0 ]]; then
+            is_first="true"
+        else
+            is_first="false"
+        fi
+
+        generate_vhost "$domain" "$site_num" "$is_first"
+        i=$((i + 1))  # FIX: Usar $(()) en lugar de ((i++)) para evitar problemas con set -e cuando i=0
     done
 
-    log "✅ ${#DOMAINS[@]} virtual hosts generados"
+    success "${#DOMAINS[@]} virtual hosts generados"
 }
 
-# Generar configuraciones PHP
 generate_php_configs() {
     log "Generando configuraciones PHP..."
     cp "${TEMPLATE_DIR}/php.ini.template" php/php.ini
     cp "${TEMPLATE_DIR}/www.conf.template" php/www.conf
-    log "✅ php.ini y www.conf generados"
+    success "php.ini y www.conf"
 }
 
-# Generar configuraciones MySQL
 generate_mysql_configs() {
     log "Generando configuraciones MySQL..."
 
@@ -285,89 +413,68 @@ generate_mysql_configs() {
         echo ""
         echo "-- Crear bases de datos"
 
-        for i in "${!DOMAINS[@]}"; do
-            local domain="${DOMAINS[$i]}"
-            local domain_sanitized=$(sanitize_domain_name "$domain")
-            echo "CREATE DATABASE IF NOT EXISTS ${domain_sanitized} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        for domain in "${DOMAINS[@]}"; do
+            local san="${DOMAIN_CACHE[$domain]}"
+            echo "CREATE DATABASE IF NOT EXISTS ${san} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         done
 
         echo ""
         echo "-- Fin de inicialización"
     } > mysql/init/01-init-databases.sql
 
-    log "✅ Configuraciones MySQL generadas"
+    success "Configuraciones MySQL"
 }
 
-# Generar .gitignore
 generate_gitignore() {
     log "Generando .gitignore..."
     cp "${TEMPLATE_DIR}/gitignore.template" .gitignore
-    log "✅ .gitignore generado"
+    success ".gitignore"
 }
 
-# Mostrar resumen
+# ══════════════════════════════════════════════════════════════════════════════
+# RESUMEN
+# ══════════════════════════════════════════════════════════════════════════════
+
 show_summary() {
-    local user password
-    user="${PHPMYADMIN_AUTH_USER:-$(grep "^PHPMYADMIN_AUTH_USER=" "$ENV_FILE" | cut -d'=' -f2)}"
-    password="${PHPMYADMIN_AUTH_PASSWORD:-$(grep "^PHPMYADMIN_AUTH_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)}"
+    banner "╔══════════════════════════════════════════════════════════════════╗"
+    banner "║              ✓ CONFIGURACIÓN COMPLETADA ✓                        ║"
+    banner "╚══════════════════════════════════════════════════════════════════╝"
 
-    cat << EOF
+    echo -e "\n${YELLOW}phpMyAdmin:${NC}"
+    echo "  URL: http://${DOMAINS[0]}/phpmyadmin/"
+    echo "  Auth HTTP → Usuario: $PHPMYADMIN_AUTH_USER | Contraseña: $PHPMYADMIN_AUTH_PASSWORD"
+    echo "  MySQL → Servidor: mysql | Usuario: root/wpuser_*"
 
-${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}
-${GREEN}✓ CONFIGURACIÓN COMPLETADA${NC}
-${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}
-
-${YELLOW}phpMyAdmin:${NC}
-  URL: http://${DOMAINS[0]}/phpmyadmin/
-  Auth HTTP → Usuario: $user | Contraseña: $password
-  MySQL → Servidor: mysql | Usuario: root/wpuser_*
-
-${YELLOW}Usuarios MySQL por sitio:${NC}
-EOF
-
-    for i in "${!DOMAINS[@]}"; do
-        local site_num=$((i + 1))
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        local password_var="DB_PASSWORD_${site_num}"
-        local password="${!password_var}"
-        echo "  ${domain}:"
-        echo "    Base de datos: ${domain_sanitized}"
-        echo "    Usuario: wpuser_${domain_sanitized}"
-        echo "    Contraseña: ${password}"
+    echo -e "\n${YELLOW}Usuarios MySQL por sitio:${NC}"
+    local i=1
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local password="${DB_PASSWORDS[$domain]:-}"
+        [[ -z "$password" ]] && password=$(grep "^DB_PASSWORD_$i=" "$ENV_FILE" | cut -d'=' -f2)
+        echo "  $domain:"
+        echo "    DB: $san | User: wpuser_$san | Pass: $password"
+        ((i++)) || true  # FIX
     done
 
-    cat << EOF
-
-${YELLOW}Usuarios SFTP independientes:${NC}
-  Host: $SERVER_IP:2222
-  Puerto: 2222
-EOF
-
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        local password_var="SFTP_${domain_sanitized^^}_PASSWORD"
-        local password="${!password_var}"
-        echo "  ${domain}:"
-        echo "    Usuario: sftp_${domain_sanitized}"
-        echo "    Carpeta: ${domain_sanitized}"
-        echo "    Directorio enjaulado: /${domain_sanitized}"
-        echo "    Comando: sftp -P 2222 sftp_${domain_sanitized}@$SERVER_IP"
+    echo -e "\n${YELLOW}Usuarios SFTP independientes:${NC}"
+    echo "  Host: $SERVER_IP:2222"
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local password="${SFTP_PASSWORDS[$domain]:-}"
+        [[ -z "$password" ]] && password=$(grep "^SFTP_${san^^}_PASSWORD=" "$ENV_FILE" | cut -d'=' -f2)
+        echo "  $domain:"
+        echo "    User: sftp_$san | Dir: /$san | Pass: $password"
     done
 
-    cat << EOF
-
-${BLUE}╚═══════════════════════════════════════════════════════════════╝${NC}
-
-${GREEN}Siguiente paso:${NC} ./scripts/setup.sh
-
-EOF
+    echo -e "\n${GREEN}Siguiente paso:${NC} ./scripts/setup.sh\n"
 }
 
-# Main
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 main() {
-    log "🚀 Iniciando generación de configuraciones..."
+    banner "══ GENERACIÓN DE CONFIGURACIONES ══"
 
     check_requirements
     load_env
@@ -381,7 +488,7 @@ main() {
     generate_mysql_configs
     generate_gitignore
 
-    log "✅ Todas las configuraciones generadas exitosamente"
+    success "Todas las configuraciones generadas"
     show_summary
 }
 

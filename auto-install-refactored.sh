@@ -31,7 +31,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 declare -a DOMAINS=()
-declare -A DOMAIN_SANITIZED=()  # Caché de nombres sanitizados
+declare -A DOMAIN_CACHE=()      # Caché de nombres sanitizados (renombrado para evitar conflicto)
 declare -A SFTP_PASSWORDS=()    # Asociativo: domain -> password
 declare -A DB_PASSWORDS=()      # Asociativo: domain -> password
 declare SERVER_IP="" IP_VERSION="" MYSQL_ROOT_PASSWORD=""
@@ -65,7 +65,7 @@ sanitize_domain() {
 # Pre-poblar caché de dominios sanitizados (llamar después de cargar DOMAINS)
 populate_domain_cache() {
     for domain in "${DOMAINS[@]}"; do
-        DOMAIN_SANITIZED[$domain]=$(sanitize_domain "$domain")
+        DOMAIN_CACHE[$domain]=$(sanitize_domain "$domain")
     done
 }
 
@@ -97,7 +97,7 @@ export_credentials() {
 
     local i=1
     for domain in "${DOMAINS[@]}"; do
-        local san="${DOMAIN_SANITIZED[$domain]}"
+        local san="${DOMAIN_CACHE[$domain]}"
         export "DB_PASSWORD_$i=${DB_PASSWORDS[$domain]}"
         export "SFTP_${san^^}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
         ((i++))
@@ -298,7 +298,7 @@ show_config_summary() {
     echo "  IP ($IP_VERSION): $SERVER_IP"
     echo "  Sitios: ${#DOMAINS[@]}"
     for domain in "${DOMAINS[@]}"; do
-        echo "    - $domain → ${DOMAIN_SANITIZED[$domain]}"
+        echo "    - $domain → ${DOMAIN_CACHE[$domain]}"
     done
     echo "  phpMyAdmin: ✓ | SFTP: ✓ (2222)"
     $INSTALL_NETDATA && echo "  Netdata: ✓ (19999)"
@@ -465,7 +465,7 @@ MySQL Root Password: $MYSQL_ROOT_PASSWORD
 HEADER
 
         for domain in "${DOMAINS[@]}"; do
-            local san="${DOMAIN_SANITIZED[$domain]}"
+            local san="${DOMAIN_CACHE[$domain]}"
             cat << SITE
 
 === ${domain} ===
@@ -520,7 +520,7 @@ ENV_HEADER
         echo ""
         echo "# SFTP - Usuarios independientes por sitio"
         for domain in "${DOMAINS[@]}"; do
-            local san="${DOMAIN_SANITIZED[$domain]}"
+            local san="${DOMAIN_CACHE[$domain]}"
             local san_upper="${san^^}"
             echo "SFTP_${san_upper}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
         done
@@ -569,7 +569,7 @@ set_wordpress_permissions() {
     sleep 3  # Esperar contenedores
 
     for domain in "${DOMAINS[@]}"; do
-        local san="${DOMAIN_SANITIZED[$domain]}"
+        local san="${DOMAIN_CACHE[$domain]}"
         local site_path="$INSTALL_DIR/www/$san"
 
         log "Permisos para $domain..."
@@ -628,7 +628,7 @@ setup_redis() {
     success "Redis activo"
 
     for domain in "${DOMAINS[@]}"; do
-        local san="${DOMAIN_SANITIZED[$domain]}"
+        local san="${DOMAIN_CACHE[$domain]}"
         local site_path="$INSTALL_DIR/www/$san"
         local wp_config="$site_path/wp-config.php"
 
@@ -786,7 +786,7 @@ show_summary() {
     echo "  MySQL Root: $MYSQL_ROOT_PASSWORD"
 
     for domain in "${DOMAINS[@]}"; do
-        local san="${DOMAIN_SANITIZED[$domain]}"
+        local san="${DOMAIN_CACHE[$domain]}"
         echo -e "\n  ${CYAN}$domain${NC} → $san"
         echo "    DB: wpuser_$san / ${DB_PASSWORDS[$domain]}"
         echo "    SFTP: sftp_$san / ${SFTP_PASSWORDS[$domain]}"

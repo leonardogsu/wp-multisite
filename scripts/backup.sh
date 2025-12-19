@@ -13,7 +13,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." 2>/dev/null && pwd || pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 BACKUP_DIR="${PROJECT_DIR}/backups"
 DATE="$(date +%Y%m%d_%H%M%S)"
-RETENTION_DAYS="${RETENTION_DAYS:-7}"
+RETENTION_DAYS="${RETENTION_DAYS:-3}"
 
 # --- Utils ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
