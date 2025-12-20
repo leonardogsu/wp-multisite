@@ -1,687 +1,460 @@
 #!/bin/bash
 
 ################################################################################
-# WordPress Multi-Site - Instalador Automático Completo
-# Versión refactorizada usando sistema de plantillas
+# WordPress Multi-Site - Instalador Automático (REFACTORIZADO)
+# Versión optimizada para eficiencia
 # Para Ubuntu 24.04 LTS
-# VERSIÓN ACTUALIZADA - SFTP + NETDATA + Nombres basados en dominio
-# + IPv4/IPv6 selection + YAML configuration
-# + Redis y Cookies unificadas
 ################################################################################
 
 set -euo pipefail
 
-# Configuración
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN Y CONSTANTES
+# ══════════════════════════════════════════════════════════════════════════════
+
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_NAME="wordpress-multisite"
 readonly INSTALL_DIR="/opt/$PROJECT_NAME"
 readonly LOG_FILE="/var/log/${PROJECT_NAME}-install.log"
 readonly CONFIG_FILE="$SCRIPT_DIR/config.yml"
 
-# Colores
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly NC='\033[0m'
+# Colores (usando tput para mayor compatibilidad)
+if [[ -t 1 ]]; then
+    readonly RED=$'\e[0;31m' GREEN=$'\e[0;32m' YELLOW=$'\e[1;33m'
+    readonly BLUE=$'\e[0;34m' CYAN=$'\e[0;36m' NC=$'\e[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''
+fi
 
-# Variables globales
+# ══════════════════════════════════════════════════════════════════════════════
+# VARIABLES GLOBALES (arrays asociativos para caché)
+# ══════════════════════════════════════════════════════════════════════════════
+
 declare -a DOMAINS=()
-declare -a SFTP_PASSWORDS=()
-declare -a DB_PASSWORDS=()
-declare SERVER_IP=""
-declare IP_VERSION=""
-declare MYSQL_ROOT_PASSWORD=""
-declare SETUP_CRON=false
-declare INSTALL_NETDATA=false
-declare INSTALL_REDIS=false
-declare UNATTENDED_MODE=false
+declare -A DOMAIN_CACHE=()      # Caché de nombres sanitizados (renombrado para evitar conflicto)
+declare -A SFTP_PASSWORDS=()    # Asociativo: domain -> password
+declare -A DB_PASSWORDS=()      # Asociativo: domain -> password
+declare SERVER_IP="" IP_VERSION="" MYSQL_ROOT_PASSWORD=""
+declare SETUP_CRON=false INSTALL_NETDATA=false INSTALL_REDIS=false UNATTENDED_MODE=false
 
-# Crear directorio de logs
-mkdir -p "$(dirname "$LOG_FILE")"
+# ══════════════════════════════════════════════════════════════════════════════
+# FUNCIONES DE UTILIDAD (OPTIMIZADAS)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Funciones de logging
-log() { echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $*" | tee -a "$LOG_FILE"; }
-error() { echo -e "${RED}[ERROR]${NC} $*" | tee -a "$LOG_FILE"; exit 1; }
-warning() { echo -e "${YELLOW}[WARNING]${NC} $*" | tee -a "$LOG_FILE"; }
-info() { echo -e "${BLUE}[INFO]${NC} $*" | tee -a "$LOG_FILE"; }
-success() { echo -e "${GREEN}[SUCCESS]${NC} $*" | tee -a "$LOG_FILE"; }
-banner() { echo -e "${CYAN}$*${NC}" | tee -a "$LOG_FILE"; }
+# Logging unificado - una sola función con prefijo variable
+_log() {
+    local level="$1" color="$2" msg="${*:3}"
+    printf '%b[%s][%s]%b %s\n' "$color" "$(date +%T)" "$level" "$NC" "$msg" | tee -a "$LOG_FILE"
+}
+log()     { _log "INFO" "$GREEN" "$@"; }
+error()   { _log "ERROR" "$RED" "$@"; exit 1; }
+warning() { _log "WARN" "$YELLOW" "$@"; }
+info()    { _log "INFO" "$BLUE" "$@"; }
+success() { _log "OK" "$GREEN" "✓ $*"; }
+banner()  { echo -e "${CYAN}$*${NC}" | tee -a "$LOG_FILE"; }
 
-# Función para sanitizar nombre de dominio
-sanitize_domain_name() {
+# Sanitizar dominio con caché (SIN subshell)
+sanitize_domain() {
     local domain="$1"
-    # Convertir puntos en guiones bajos y eliminar caracteres especiales
-    echo "$domain" | tr '.' '_' | tr '-' '_' | sed 's/[^a-zA-Z0-9_]//g'
+    local sanitized="${domain//./_}"
+    sanitized="${sanitized//-/_}"
+    sanitized="${sanitized//[^a-zA-Z0-9_]/}"
+    echo "$sanitized"
 }
 
-# Función para instalar yq (versión Go de Mike Farah)
-install_yq() {
-    log "Instalando yq (versión Go de Mike Farah)..."
+# Pre-poblar caché de dominios sanitizados (llamar después de cargar DOMAINS)
+populate_domain_cache() {
+    for domain in "${DOMAINS[@]}"; do
+        DOMAIN_CACHE[$domain]=$(sanitize_domain "$domain")
+    done
+}
 
-    # Eliminar versión antigua si existe (la de apt es incompatible)
-    if command -v yq &>/dev/null; then
-        local yq_version
-        yq_version=$(yq --version 2>&1 || echo "")
-        # Si no es la versión de Mike Farah, eliminarla
-        if [[ ! "$yq_version" =~ "github.com/mikefarah/yq" ]]; then
-            warning "Versión incompatible de yq detectada, reemplazando..."
-            apt-get remove -y yq >> "$LOG_FILE" 2>&1 || true
-            rm -f /usr/local/bin/yq 2>/dev/null || true
-            rm -f /usr/bin/yq 2>/dev/null || true
-        else
-            success "✓ yq (versión correcta) ya instalado"
-            return 0
-        fi
+# Generar contraseña (bash puro cuando sea posible)
+generate_password() {
+    local length="${1:-32}"
+    if command -v pwgen &>/dev/null; then
+        pwgen -s "$length" 1
+    else
+        # Fallback bash puro
+        head -c 100 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
+    fi
+}
+
+# Ejecutar apt silenciosamente
+apt_install() {
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >> "$LOG_FILE" 2>&1
+}
+
+# Verificar comando existe
+cmd_exists() { command -v "$1" &>/dev/null; }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORTAR VARIABLES (una sola función centralizada)
+# ══════════════════════════════════════════════════════════════════════════════
+
+export_credentials() {
+    export MYSQL_ROOT_PASSWORD SERVER_IP IP_VERSION
+
+    local i=1
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        export "DB_PASSWORD_$i=${DB_PASSWORDS[$domain]}"
+        export "SFTP_${san^^}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
+        ((i++))
+    done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YQ INSTALLATION (simplificado)
+# ══════════════════════════════════════════════════════════════════════════════
+
+install_yq() {
+    # Verificar si ya está instalado correctamente
+    if cmd_exists yq && [[ "$(yq --version 2>&1)" == *"mikefarah"* ]]; then
+        return 0
     fi
 
-    # Detectar arquitectura
+    log "Instalando yq..."
+
+    # Remover versión incompatible
+    rm -f /usr/local/bin/yq /usr/bin/yq 2>/dev/null || true
+    apt-get remove -y yq >> "$LOG_FILE" 2>&1 || true
+
+    # Mapeo de arquitectura
+    local arch_map=([amd64]="amd64" [arm64]="arm64" [armhf]="arm" [i386]="386")
     local arch
     arch=$(dpkg --print-architecture)
-    local yq_arch=""
+    local yq_arch="${arch_map[$arch]:-}"
 
-    case "$arch" in
-        amd64) yq_arch="amd64" ;;
-        arm64) yq_arch="arm64" ;;
-        armhf) yq_arch="arm" ;;
-        i386)  yq_arch="386" ;;
-        *)     error "Arquitectura no soportada: $arch" ;;
-    esac
+    [[ -z "$yq_arch" ]] && error "Arquitectura no soportada: $arch"
 
-    # Descargar última versión de yq
-    local yq_url="https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${yq_arch}"
+    wget -qO /usr/local/bin/yq \
+        "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${yq_arch}" \
+        && chmod +x /usr/local/bin/yq \
+        && ln -sf /usr/local/bin/yq /usr/bin/yq 2>/dev/null || true
 
-    if wget -q "$yq_url" -O /usr/local/bin/yq >> "$LOG_FILE" 2>&1; then
-        chmod +x /usr/local/bin/yq
-
-        # Verificar instalación
-        if /usr/local/bin/yq --version >> "$LOG_FILE" 2>&1; then
-            success "✓ yq instalado correctamente"
-            # Asegurar que está en el PATH
-            if [[ ! -L /usr/bin/yq ]]; then
-                ln -sf /usr/local/bin/yq /usr/bin/yq 2>/dev/null || true
-            fi
-            return 0
-        else
-            error "yq se descargó pero no funciona correctamente"
-        fi
-    else
-        error "No se pudo descargar yq desde $yq_url"
-    fi
+    /usr/local/bin/yq --version >> "$LOG_FILE" 2>&1 || error "yq installation failed"
+    success "yq instalado"
 }
 
-# Verificar root
-check_root() {
-    [[ $EUID -eq 0 ]] || error "Este script debe ejecutarse como root (usa sudo)"
-}
+# ══════════════════════════════════════════════════════════════════════════════
+# VERIFICACIONES DEL SISTEMA (consolidadas)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Banner principal
-show_main_banner() {
-    clear
-    cat << "EOF"
-╔═══════════════════════════════════════════════════════════════════════╗
-║                                                                       ║
-║            WordPress Multi-Site Instalador Automático                ║
-║                     Para Ubuntu 24.04 LTS                             ║
-║                                                                       ║
-║                  Instalación Completamente Automatizada               ║
-║                   Incluye: phpMyAdmin + SFTP Server                   ║
-║                   + IPv4/IPv6 + YAML Configuration                    ║
-║                                                                       ║
-╚═══════════════════════════════════════════════════════════════════════╝
-EOF
-    echo ""
-    log "Iniciando instalación automática completa..."
-    log "Logs: $LOG_FILE"
+check_prerequisites() {
+    banner "══ PASO 1: Verificación de requisitos ══"
 
-    # Verificar si existe archivo de configuración
-    if [[ -f "$CONFIG_FILE" ]]; then
-        success "✓ Archivo de configuración encontrado: $CONFIG_FILE"
-        UNATTENDED_MODE=true
-        log "Modo: DESATENDIDO (configuración desde YAML)"
+    # Root check
+    [[ $EUID -eq 0 ]] || error "Ejecutar como root (sudo)"
 
-        # Instalar yq si no está disponible o es versión incorrecta (necesario para modo desatendido)
-        install_yq
-    else
-        info "Archivo de configuración no encontrado: $CONFIG_FILE"
-        log "Modo: INTERACTIVO"
-    fi
-
-    echo ""
-    sleep 2
-}
-
-# Verificar requisitos del sistema
-verify_system_requirements() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 1: Verificación de requisitos del sistema"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-
-    # Ubuntu 24.04
-    info "Verificando Ubuntu..."
-    if ! grep -q "24.04" /etc/os-release; then
+    # Ubuntu check
+    if ! grep -q "24.04" /etc/os-release 2>/dev/null; then
         warning "Diseñado para Ubuntu 24.04 LTS"
-        if [[ $UNATTENDED_MODE == false ]]; then
-            read -rp "¿Continuar? (s/n): " continue
-            [[ $continue =~ ^[Ss]$ ]] || error "Instalación cancelada"
-        else
-            warning "Continuando en modo desatendido..."
-        fi
+        [[ $UNATTENDED_MODE == false ]] && { read -rp "¿Continuar? (s/n): " c; [[ $c =~ ^[Ss]$ ]] || exit 1; }
     else
-        success "✓ Ubuntu 24.04 LTS"
+        success "Ubuntu 24.04 LTS"
     fi
 
-    # RAM
-    info "Verificando RAM..."
-    local ram_mb
-    ram_mb=$(free -m | awk 'NR==2{print $2}')
-    if [[ $ram_mb -lt 4000 ]]; then
-        warning "Se recomienda 8GB+ RAM. Sistema: ${ram_mb}MB"
-    else
-        success "✓ RAM: ${ram_mb}MB"
-    fi
+    # RAM & Disk (lectura única de /proc y df)
+    local ram_mb disk_gb
+    ram_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    disk_gb=$(df / --output=avail | tail -1 | awk '{print int($1/1024/1024)}')
 
-    # Disco
-    info "Verificando espacio..."
-    local disk_gb
-    disk_gb=$(df / | awk 'NR==2{print int($4/1024/1024)}')
-    if [[ $disk_gb -lt 20 ]]; then
-        warning "Se recomienda 20GB+ libres. Disponible: ${disk_gb}GB"
-    else
-        success "✓ Espacio: ${disk_gb}GB"
-    fi
+    [[ $ram_mb -lt 4000 ]] && warning "RAM: ${ram_mb}MB (recomendado 8GB+)" || success "RAM: ${ram_mb}MB"
+    [[ $disk_gb -lt 20 ]] && warning "Disco: ${disk_gb}GB (recomendado 20GB+)" || success "Disco: ${disk_gb}GB"
 
-    echo ""
-    sleep 2
+    # Config file check
+    if [[ -f "$CONFIG_FILE" ]]; then
+        success "Config YAML encontrado"
+        UNATTENDED_MODE=true
+        install_yq
+    fi
 }
 
-# Detectar direcciones IP (IPv4 e IPv6)
-detect_ip_addresses() {
-    local ipv4=""
-    local ipv6=""
+# ══════════════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE IP (optimizada)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Detectar IPv4
-    ipv4=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || \
-           curl -4 -s --max-time 10 icanhazip.com 2>/dev/null || \
-           ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || \
-           echo "")
+detect_ips() {
+    local -n ipv4_ref=$1 ipv6_ref=$2
 
-    # Detectar IPv6
-    ipv6=$(curl -6 -s --max-time 10 ifconfig.me 2>/dev/null || \
-           curl -6 -s --max-time 10 icanhazip.com 2>/dev/null || \
-           ip -6 addr show scope global | grep -oP '(?<=inet6\s)[0-9a-f:]+' | grep -v '^fe80' | head -n1 || \
-           echo "")
+    # IPv4 - intentar servicios externos, luego local
+    ipv4_ref=$(curl -4s --max-time 5 ifconfig.me 2>/dev/null) || \
+    ipv4_ref=$(ip -4 route get 1 2>/dev/null | awk '{print $7; exit}') || \
+    ipv4_ref=""
 
-    echo "$ipv4|$ipv6"
+    # IPv6
+    ipv6_ref=$(curl -6s --max-time 5 ifconfig.me 2>/dev/null) || \
+    ipv6_ref=$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{print $2; exit}' | cut -d/ -f1) || \
+    ipv6_ref=""
 }
 
-# Cargar configuración desde YAML
-load_config_from_yaml() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        return 1
-    fi
+# ══════════════════════════════════════════════════════════════════════════════
+# CARGAR CONFIGURACIÓN YAML
+# ══════════════════════════════════════════════════════════════════════════════
 
-    log "Cargando configuración desde $CONFIG_FILE..."
+load_yaml_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
 
-    # Verificar que yq esté instalado (versión correcta)
-    if ! command -v yq &>/dev/null; then
-        error "yq no está instalado. Esto no debería ocurrir."
-    fi
+    log "Cargando configuración YAML..."
 
-    # Verificar que sea la versión correcta
-    local yq_version
-    yq_version=$(yq --version 2>&1 || echo "")
-    if [[ ! "$yq_version" =~ "github.com/mikefarah/yq" ]]; then
-        error "Versión incorrecta de yq. Se requiere la versión Go de Mike Farah."
-    fi
+    # Leer todo de una vez (menos llamadas a yq)
+    local config
+    config=$(yq eval -o=json '.' "$CONFIG_FILE" 2>/dev/null) || error "YAML inválido"
 
-    # Cargar IP version
-    local ip_version_config
-    ip_version_config=$(yq eval '.server.ip_version' "$CONFIG_FILE" 2>/dev/null || echo "ipv4")
-    IP_VERSION="${ip_version_config,,}"  # convertir a minúsculas
+    # Extraer valores con jq (más eficiente que múltiples llamadas a yq)
+    IP_VERSION=$(echo "$config" | jq -r '.server.ip_version // "ipv4"' | tr '[:upper:]' '[:lower:]')
+    local ip_addr
+    ip_addr=$(echo "$config" | jq -r '.server.ip_address // ""')
 
-    # Cargar IP address (si está especificada)
-    local ip_address_config
-    ip_address_config=$(yq eval '.server.ip_address' "$CONFIG_FILE" 2>/dev/null || echo "")
-
-    if [[ -n "$ip_address_config" && "$ip_address_config" != "null" ]]; then
-        SERVER_IP="$ip_address_config"
-        success "✓ IP desde config: $SERVER_IP"
+    # IP detection si no está especificada
+    if [[ -n "$ip_addr" && "$ip_addr" != "null" ]]; then
+        SERVER_IP="$ip_addr"
     else
-        # Detectar automáticamente según versión
-        local detected_ips
-        detected_ips=$(detect_ip_addresses)
-        local ipv4="${detected_ips%%|*}"
-        local ipv6="${detected_ips##*|}"
+        local ipv4="" ipv6=""
+        detect_ips ipv4 ipv6
 
         case "$IP_VERSION" in
-            ipv4)
-                SERVER_IP="$ipv4"
-                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar IPv4"
-                ;;
-            ipv6)
-                SERVER_IP="$ipv6"
-                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar IPv6"
-                ;;
-            both|dual)
-                # Preferir IPv4 si está disponible
-                SERVER_IP="${ipv4:-$ipv6}"
-                [[ -z "$SERVER_IP" ]] && error "No se pudo detectar ninguna IP"
-                ;;
-            *)
-                error "ip_version inválida en config: $IP_VERSION (usa: ipv4, ipv6, both)"
-                ;;
+            ipv4) SERVER_IP="$ipv4"; [[ -z "$SERVER_IP" ]] && error "IPv4 no detectada" ;;
+            ipv6) SERVER_IP="$ipv6"; [[ -z "$SERVER_IP" ]] && error "IPv6 no detectada" ;;
+            both|dual) SERVER_IP="${ipv4:-$ipv6}"; [[ -z "$SERVER_IP" ]] && error "IP no detectada" ;;
+            *) error "ip_version inválida: $IP_VERSION" ;;
         esac
-        success "✓ IP detectada ($IP_VERSION): $SERVER_IP"
     fi
+    success "IP ($IP_VERSION): $SERVER_IP"
 
-    # Cargar dominios
-    local domain_count
-    domain_count=$(yq eval '.domains | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    # Cargar dominios (una sola llamada a yq)
+    mapfile -t DOMAINS < <(echo "$config" | jq -r '.domains[]? // empty')
+    [[ ${#DOMAINS[@]} -eq 0 ]] && error "No hay dominios configurados"
+    success "Dominios: ${#DOMAINS[@]}"
 
-    if [[ "$domain_count" -eq 0 ]]; then
-        error "No hay dominios configurados en $CONFIG_FILE"
-    fi
+    # Opciones booleanas
+    SETUP_CRON=$(echo "$config" | jq -r '.options.setup_cron // false')
+    INSTALL_NETDATA=$(echo "$config" | jq -r '.options.install_netdata // false')
+    INSTALL_REDIS=$(echo "$config" | jq -r '.options.install_redis // false')
 
-    for ((i=0; i<domain_count; i++)); do
-        local domain
-        domain=$(yq eval ".domains[$i]" "$CONFIG_FILE" 2>/dev/null)
-        if [[ -n "$domain" && "$domain" != "null" ]]; then
-            DOMAINS+=("$domain")
-        fi
-    done
-
-    success "✓ Dominios cargados: ${#DOMAINS[@]}"
-
-    # Cargar opciones
-    local setup_cron_config
-    setup_cron_config=$(yq eval '.options.setup_cron' "$CONFIG_FILE" 2>/dev/null || echo "false")
-    [[ "$setup_cron_config" == "true" ]] && SETUP_CRON=true || SETUP_CRON=false
-
-    local install_netdata_config
-    install_netdata_config=$(yq eval '.options.install_netdata' "$CONFIG_FILE" 2>/dev/null || echo "false")
-    [[ "$install_netdata_config" == "true" ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
-
-    local install_redis_config
-    install_redis_config=$(yq eval '.options.install_redis' "$CONFIG_FILE" 2>/dev/null || echo "false")
-    [[ "$install_redis_config" == "true" ]] && INSTALL_REDIS=true || INSTALL_REDIS=false
-
-    success "✓ Configuración cargada desde YAML"
-    return 0
+    # Normalizar booleanos
+    [[ "$SETUP_CRON" == "true" ]] && SETUP_CRON=true || SETUP_CRON=false
+    [[ "$INSTALL_NETDATA" == "true" ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
+    [[ "$INSTALL_REDIS" == "true" ]] && INSTALL_REDIS=true || INSTALL_REDIS=false
 }
 
-# Recopilar información del usuario (modo interactivo)
-gather_user_input() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 2: Recopilación de información"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRADA INTERACTIVA (simplificada)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Si hay archivo YAML, cargar desde ahí
+gather_interactive_input() {
+    banner "══ PASO 2: Recopilación de información ══"
+
     if [[ $UNATTENDED_MODE == true ]]; then
-        load_config_from_yaml || error "Error al cargar configuración desde YAML"
+        load_yaml_config
     else
-        # Modo interactivo original con selección de IP
-        info "Detectando direcciones IP..."
-        local detected_ips
-        detected_ips=$(detect_ip_addresses)
-        local ipv4="${detected_ips%%|*}"
-        local ipv6="${detected_ips##*|}"
+        # Detección IP
+        local ipv4="" ipv6=""
+        detect_ips ipv4 ipv6
 
-        echo ""
-        info "Direcciones IP detectadas:"
+        echo -e "\nDirecciones IP detectadas:"
         [[ -n "$ipv4" ]] && echo "  1) IPv4: $ipv4" || echo "  1) IPv4: (no detectada)"
         [[ -n "$ipv6" ]] && echo "  2) IPv6: $ipv6" || echo "  2) IPv6: (no detectada)"
-        echo "  3) Ingresar manualmente"
-        echo ""
+        echo "  3) Manual"
 
-        local ip_choice
         while true; do
-            read -rp "Selecciona opción [1-3]: " ip_choice
-            case "$ip_choice" in
-                1)
-                    if [[ -n "$ipv4" ]]; then
-                        SERVER_IP="$ipv4"
-                        IP_VERSION="ipv4"
-                        break
-                    else
-                        warning "IPv4 no disponible"
-                    fi
-                    ;;
-                2)
-                    if [[ -n "$ipv6" ]]; then
-                        SERVER_IP="$ipv6"
-                        IP_VERSION="ipv6"
-                        break
-                    else
-                        warning "IPv6 no disponible"
-                    fi
-                    ;;
-                3)
-                    read -rp "Ingresa la IP del servidor: " SERVER_IP
-                    read -rp "¿Es IPv4 o IPv6? (4/6): " version_choice
-                    [[ "$version_choice" == "6" ]] && IP_VERSION="ipv6" || IP_VERSION="ipv4"
-                    break
-                    ;;
-                *)
-                    warning "Opción inválida"
-                    ;;
+            read -rp "Selecciona [1-3]: " choice
+            case "$choice" in
+                1) [[ -n "$ipv4" ]] && { SERVER_IP="$ipv4"; IP_VERSION="ipv4"; break; } ;;
+                2) [[ -n "$ipv6" ]] && { SERVER_IP="$ipv6"; IP_VERSION="ipv6"; break; } ;;
+                3) read -rp "IP: " SERVER_IP
+                   read -rp "¿IPv4 o IPv6? (4/6): " v
+                   IP_VERSION=$([[ "$v" == "6" ]] && echo "ipv6" || echo "ipv4")
+                   break ;;
             esac
         done
 
-        success "IP seleccionada ($IP_VERSION): $SERVER_IP"
-
         # Dominios
-        echo ""
-        info "Ingresa los dominios (Enter vacío para terminar):"
-        local counter=1
-        while true; do
-            read -rp "  Dominio $counter: " domain
-            [[ -z "$domain" ]] && break
-
+        echo -e "\nIngresa dominios (Enter vacío para terminar):"
+        while read -rp "  Dominio: " domain && [[ -n "$domain" ]]; do
             if [[ $domain =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
                 DOMAINS+=("$domain")
-                ((counter++))
             else
-                warning "    Formato inválido"
+                warning "Formato inválido"
             fi
         done
+        [[ ${#DOMAINS[@]} -eq 0 ]] && error "Se requiere al menos un dominio"
 
-        [[ ${#DOMAINS[@]} -gt 0 ]] || error "Debes ingresar al menos un dominio"
-
-        # Backup automático
-        echo ""
-        read -rp "¿Configurar backup automático diario? (s/n): " setup_cron
-        [[ $setup_cron =~ ^[Ss]$ ]] && SETUP_CRON=true || SETUP_CRON=false
-
-        # Pregunta sobre Netdata
-        echo ""
-        read -rp "¿Instalar Netdata (monitoreo en tiempo real)? (s/n): " setup_netdata
-        [[ $setup_netdata =~ ^[Ss]$ ]] && INSTALL_NETDATA=true || INSTALL_NETDATA=false
-
-        # Pregunta sobre Redis
-        echo ""
-        read -rp "¿Instalar Redis (caché de objetos para WordPress)? (s/n): " setup_redis
-        [[ $setup_redis =~ ^[Ss]$ ]] && INSTALL_REDIS=true || INSTALL_REDIS=false
+        # Opciones (lectura simplificada)
+        read -rp "¿Backup automático? (s/n): " r; [[ $r =~ ^[Ss]$ ]] && SETUP_CRON=true
+        read -rp "¿Instalar Netdata? (s/n): " r; [[ $r =~ ^[Ss]$ ]] && INSTALL_NETDATA=true
+        read -rp "¿Instalar Redis? (s/n): " r; [[ $r =~ ^[Ss]$ ]] && INSTALL_REDIS=true
     fi
 
-    # Mostrar resumen (tanto para modo interactivo como desatendido)
-    echo ""
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  RESUMEN DE CONFIGURACIÓN"
-    banner "═══════════════════════════════════════════════════════════════════════"
+    # Pre-calcular nombres sanitizados
+    populate_domain_cache
+
+    show_config_summary
+}
+
+show_config_summary() {
+    banner "══ RESUMEN ══"
     echo "  IP ($IP_VERSION): $SERVER_IP"
     echo "  Sitios: ${#DOMAINS[@]}"
     for domain in "${DOMAINS[@]}"; do
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo "    - $domain → ${domain_sanitized}"
+        echo "    - $domain → ${DOMAIN_CACHE[$domain]}"
     done
-    echo ""
-    success "  ✓ phpMyAdmin: INCLUIDO"
-    success "  ✓ SFTP Server: INCLUIDO (puerto 2222)"
-    [[ $INSTALL_NETDATA == true ]] && success "  ✓ Netdata: INCLUIDO (puerto 19999)"
-    [[ $INSTALL_REDIS == true ]] && success "  ✓ Redis: INCLUIDO (caché de objetos)"
-    echo "  Backup: $([[ $SETUP_CRON == true ]] && echo 'Sí' || echo 'No')"
-    echo "  Directorio: $INSTALL_DIR"
-    [[ $UNATTENDED_MODE == true ]] && echo "  Modo: DESATENDIDO"
-    echo ""
+    echo "  phpMyAdmin: ✓ | SFTP: ✓ (2222)"
+    $INSTALL_NETDATA && echo "  Netdata: ✓ (19999)"
+    $INSTALL_REDIS && echo "  Redis: ✓"
+    echo "  Backup: $($SETUP_CRON && echo 'Sí' || echo 'No')"
 
     if [[ $UNATTENDED_MODE == false ]]; then
-        read -rp "¿Continuar? (s/n): " confirm
-        [[ $confirm =~ ^[Ss]$ ]] || error "Instalación cancelada"
-    else
-        info "Continuando en modo desatendido..."
+        read -rp "¿Continuar? (s/n): " c
+        [[ $c =~ ^[Ss]$ ]] || error "Cancelado"
     fi
-
-    echo ""
-    sleep 2
 }
 
-# Actualizar sistema
-update_system() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 3: Actualización del sistema"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# INSTALACIÓN DE PAQUETES (consolidada)
+# ══════════════════════════════════════════════════════════════════════════════
+
+install_packages() {
+    banner "══ PASO 3: Instalación de paquetes ══"
 
     export DEBIAN_FRONTEND=noninteractive
 
-    log "Actualizando repositorios..."
-    apt-get update -qq >> "$LOG_FILE" 2>&1 || error "Error al actualizar"
-    success "✓ Repositorios actualizados"
-
-    log "Instalando actualizaciones..."
-    apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1 || warning "Algunas actualizaciones fallaron"
-    success "✓ Sistema actualizado"
+    log "Actualizando sistema..."
+    apt-get update -qq >> "$LOG_FILE" 2>&1
+    apt-get upgrade -y -qq >> "$LOG_FILE" 2>&1 || true
+    success "Sistema actualizado"
 
     log "Instalando dependencias..."
-    apt-get install -y -qq \
-        apt-transport-https ca-certificates curl gnupg lsb-release \
+    apt_install apt-transport-https ca-certificates curl gnupg lsb-release \
         software-properties-common git wget unzip pwgen jq ufw cron \
-        apache2-utils openssh-client \
-        >> "$LOG_FILE" 2>&1 || error "Error al instalar dependencias"
-    success "✓ Dependencias instaladas"
+        apache2-utils openssh-client
+    success "Dependencias instaladas"
 
-    # Instalar yq si aún no está (para modo interactivo o por si acaso)
-    if ! command -v yq &>/dev/null || [[ ! "$(yq --version 2>&1)" =~ "github.com/mikefarah/yq" ]]; then
-        install_yq
-    fi
-
-    echo ""
-    sleep 2
+    # yq si no está
+    cmd_exists yq || install_yq
 }
 
-# Instalar Docker
 install_docker() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 4: Instalación de Docker"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+    banner "══ PASO 4: Docker ══"
 
-    if command -v docker &>/dev/null; then
-        warning "Docker ya instalado"
-        docker --version | tee -a "$LOG_FILE"
+    if cmd_exists docker; then
+        success "Docker ya instalado: $(docker --version)"
     else
         log "Instalando Docker..."
 
-        # Llave GPG
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
         chmod a+r /etc/apt/keyrings/docker.asc
 
-        # Repositorio
+        local codename
+        codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-            tee /etc/apt/sources.list.d/docker.list > /dev/null
+https://download.docker.com/linux/ubuntu $codename stable" > /etc/apt/sources.list.d/docker.list
 
         apt-get update -qq >> "$LOG_FILE" 2>&1
-
-        # Instalar
-        apt-get install -y -qq docker-ce docker-ce-cli containerd.io \
-            docker-buildx-plugin docker-compose-plugin >> "$LOG_FILE" 2>&1 || \
-            error "Error al instalar Docker"
-
-        success "✓ Docker instalado"
+        apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        success "Docker instalado"
     fi
 
-    # Verificar Docker Compose
-    if ! docker compose version &>/dev/null; then
-        error "Docker Compose no disponible"
-    fi
-
-    success "✓ Docker Compose disponible"
-    echo ""
-    sleep 2
+    docker compose version &>/dev/null || error "Docker Compose no disponible"
+    success "Docker Compose disponible"
 }
 
-# Configurar firewall
-configure_firewall() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 5: Configuración del firewall"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# FIREWALL (simplificado)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    log "Configurando UFW..."
+configure_firewall() {
+    banner "══ PASO 5: Firewall ══"
 
     ufw --force reset >> "$LOG_FILE" 2>&1
     ufw default deny incoming >> "$LOG_FILE" 2>&1
     ufw default allow outgoing >> "$LOG_FILE" 2>&1
 
-    # Puertos esenciales
-    ufw allow 22/tcp comment 'SSH' >> "$LOG_FILE" 2>&1
-    ufw allow 80/tcp comment 'HTTP' >> "$LOG_FILE" 2>&1
-    ufw allow 443/tcp comment 'HTTPS' >> "$LOG_FILE" 2>&1
-    ufw allow 2222/tcp comment 'SFTP' >> "$LOG_FILE" 2>&1
+    # Puertos en un loop
+    local ports=("22/tcp:SSH" "80/tcp:HTTP" "443/tcp:HTTPS" "2222/tcp:SFTP")
+    for p in "${ports[@]}"; do
+        ufw allow "${p%:*}" comment "${p#*:}" >> "$LOG_FILE" 2>&1
+    done
 
     ufw --force enable >> "$LOG_FILE" 2>&1
-
-    success "✓ Firewall configurado"
-    success "  - SSH: 22"
-    success "  - HTTP: 80"
-    success "  - HTTPS: 443"
-    success "  - SFTP: 2222"
-
-    echo ""
-    sleep 2
+    success "Firewall configurado (22, 80, 443, 2222)"
 }
 
-# Instalar Netdata
+# ══════════════════════════════════════════════════════════════════════════════
+# NETDATA (condicional)
+# ══════════════════════════════════════════════════════════════════════════════
+
 install_netdata() {
-    if [[ $INSTALL_NETDATA != true ]]; then
-        return 0
-    fi
+    $INSTALL_NETDATA || return 0
 
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  INSTALACIÓN DE NETDATA"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+    banner "══ Netdata ══"
 
-    log "Instalando Netdata..."
-
-    # Descargar e instalar Netdata con opciones no interactivas
-    if curl -fsSL https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh; then
-        chmod +x /tmp/netdata-kickstart.sh
-
-        # Instalación no interactiva
-        bash /tmp/netdata-kickstart.sh --non-interactive --stable-channel \
-            --disable-telemetry >> "$LOG_FILE" 2>&1 || {
-            warning "Error al instalar Netdata"
+    if curl -fsSL https://get.netdata.cloud/kickstart.sh -o /tmp/netdata.sh; then
+        bash /tmp/netdata.sh --non-interactive --stable-channel --disable-telemetry >> "$LOG_FILE" 2>&1 || {
+            warning "Error instalando Netdata"
             return 1
         }
+        rm -f /tmp/netdata.sh
 
-        rm -f /tmp/netdata-kickstart.sh
+        # Configurar solo localhost
+        local conf="/etc/netdata/netdata.conf"
+        [[ -f "$conf" ]] && sed -i 's/^[[:space:]]*bind socket to IP =.*/    bind socket to IP = 127.0.0.1/' "$conf"
 
-        # Configurar para SOLO escuchar en localhost (túnel SSH únicamente)
-        if [[ -f /etc/netdata/netdata.conf ]]; then
-            # Asegurar que solo escucha en localhost
-            sed -i 's/^[[:space:]]*bind socket to IP =.*/    bind socket to IP = 127.0.0.1/' \
-                /etc/netdata/netdata.conf 2>/dev/null || true
-
-            # Verificar y forzar si no existe la línea
-            if ! grep -q "bind socket to IP = 127.0.0.1" /etc/netdata/netdata.conf; then
-                sed -i '/\[web\]/a\    bind socket to IP = 127.0.0.1' /etc/netdata/netdata.conf 2>/dev/null || true
-            fi
-        fi
-
-        # Reiniciar servicio
-        systemctl restart netdata || true
-
-        # Verificar que está corriendo
-        if systemctl is-active --quiet netdata; then
-            success "✓ Netdata instalado y corriendo"
-            success "  Configurado SOLO para acceso por túnel SSH (seguro)"
-            info "  Acceso (ÚNICO método):"
-            info "  ssh -L 19999:localhost:19999 root@$SERVER_IP"
-            info "  Luego abrir en navegador: http://localhost:19999"
-        else
-            warning "Netdata instalado pero no está corriendo"
-            info "  Iniciar manualmente: systemctl start netdata"
-        fi
-    else
-        warning "No se pudo descargar el instalador de Netdata"
-        return 1
+        systemctl restart netdata 2>/dev/null || true
+        success "Netdata instalado (acceso solo por túnel SSH)"
     fi
-
-    echo ""
-    sleep 2
 }
 
-# Crear estructura de directorios
-create_directories() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 6: Creación de estructura"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# ESTRUCTURA Y CREDENCIALES
+# ══════════════════════════════════════════════════════════════════════════════
 
-    log "Creando directorios..."
+setup_structure() {
+    banner "══ PASO 6: Estructura de directorios ══"
 
-    # Crear directorio principal
     mkdir -p "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 
-    # Estructura completa
-    mkdir -p {nginx/{conf.d,auth},php,mysql/{init,data},www,certbot/{conf,www},logs/{nginx,php,mysql},scripts,backups,templates}
+    # Crear todos los directorios de una vez
+    mkdir -p nginx/{conf.d,auth} php mysql/{init,data} www certbot/{conf,www} \
+             logs/{nginx,php,mysql} scripts backups templates
 
-    success "✓ Estructura creada en $INSTALL_DIR"
-    echo ""
-    sleep 2
+    success "Estructura creada"
 }
 
-# Verificar MySQL existente
-check_existing_mysql() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 7: Verificación de MySQL"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-
-    log "Verificando volumen MySQL..."
+check_mysql_volume() {
+    banner "══ PASO 7: Verificación MySQL ══"
 
     if docker volume inspect mysql-data &>/dev/null; then
-        warning "Volumen MySQL existente detectado"
-
+        warning "Volumen MySQL existente"
         if [[ $UNATTENDED_MODE == false ]]; then
-            read -rp "¿Eliminar datos anteriores? (s/n): " remove_data
-            if [[ $remove_data =~ ^[Ss]$ ]]; then
-                docker volume rm mysql-data >> "$LOG_FILE" 2>&1 || true
-                success "✓ Volumen eliminado"
-            else
-                info "Usando volumen existente"
-            fi
-        else
-            warning "Modo desatendido: conservando volumen existente"
-            info "Para eliminarlo, detén los contenedores y ejecuta: docker volume rm mysql-data"
+            read -rp "¿Eliminar datos anteriores? (s/n): " r
+            [[ $r =~ ^[Ss]$ ]] && docker volume rm mysql-data >> "$LOG_FILE" 2>&1 || true
         fi
     else
-        success "✓ No hay volumen previo"
+        success "Sin volumen MySQL previo"
     fi
-
-    echo ""
-    sleep 2
 }
 
-# Generar credenciales
-generate_credentials() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 8: Generación de credenciales"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+generate_all_credentials() {
+    banner "══ PASO 8: Generación de credenciales ══"
 
-    log "Generando contraseñas..."
-    MYSQL_ROOT_PASSWORD=$(pwgen -s 32 1)
+    MYSQL_ROOT_PASSWORD=$(generate_password 32)
 
-    # Generar contraseña de DB y SFTP para cada sitio
-    for i in "${!DOMAINS[@]}"; do
-        DB_PASSWORDS+=("$(pwgen -s 32 1)")
-        SFTP_PASSWORDS+=("$(pwgen -s 24 1)")
+    # Generar credenciales para todos los dominios
+    for domain in "${DOMAINS[@]}"; do
+        DB_PASSWORDS[$domain]=$(generate_password 32)
+        SFTP_PASSWORDS[$domain]=$(generate_password 24)
     done
 
-    success "✓ Credenciales generadas"
-
-    # Guardar credenciales
+    # ════════════════════════════════════════════════════════════════════
+    # ARCHIVO .credentials (formato legible)
+    # ════════════════════════════════════════════════════════════════════
     local cred_file="$INSTALL_DIR/.credentials"
-    cat > "$cred_file" << EOF
+    {
+        cat << HEADER
 # CREDENCIALES DEL SISTEMA
 # Generadas: $(date)
 # GUARDAR EN LUGAR SEGURO
@@ -689,26 +462,30 @@ generate_credentials() {
 MySQL Root Password: $MYSQL_ROOT_PASSWORD
 
 # Credenciales por sitio
-EOF
+HEADER
 
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo "" >> "$cred_file"
-        echo "=== ${domain} ===" >> "$cred_file"
-        echo "Carpeta: ${domain_sanitized}" >> "$cred_file"
-        echo "Base de datos: ${domain_sanitized}" >> "$cred_file"
-        echo "Usuario DB: wpuser_${domain_sanitized}" >> "$cred_file"
-        echo "Password DB: ${DB_PASSWORDS[$i]}" >> "$cred_file"
-        echo "Usuario SFTP: sftp_${domain_sanitized}" >> "$cred_file"
-        echo "Password SFTP: ${SFTP_PASSWORDS[$i]}" >> "$cred_file"
-    done
+        for domain in "${DOMAINS[@]}"; do
+            local san="${DOMAIN_CACHE[$domain]}"
+            cat << SITE
 
+=== ${domain} ===
+Carpeta: ${san}
+Base de datos: ${san}
+Usuario DB: wpuser_${san}
+Password DB: ${DB_PASSWORDS[$domain]}
+Usuario SFTP: sftp_${san}
+Password SFTP: ${SFTP_PASSWORDS[$domain]}
+SITE
+        done
+    } > "$cred_file"
     chmod 600 "$cred_file"
+    chown root:root "$cred_file"
 
-    # Crear .env
-    log "Creando .env..."
-    cat > .env << EOF
+    # ════════════════════════════════════════════════════════════════════
+    # ARCHIVO .env (formato para docker-compose y scripts)
+    # ════════════════════════════════════════════════════════════════════
+    {
+        cat << ENV_HEADER
 # Variables de entorno
 # Generadas: $(date)
 
@@ -724,712 +501,334 @@ INSTALL_PHPMYADMIN=true
 INSTALL_SFTP=true
 
 # Dominios
-EOF
+ENV_HEADER
 
-    for i in "${!DOMAINS[@]}"; do
-        echo "DOMAIN_$((i+1))=${DOMAINS[$i]}" >> .env
-    done
+        local i=1
+        for domain in "${DOMAINS[@]}"; do
+            echo "DOMAIN_$i=$domain"
+            ((i++))
+        done
 
-    # Añadir contraseñas DB por sitio
-    echo "" >> .env
-    echo "# Database passwords por sitio" >> .env
-    for i in "${!DOMAINS[@]}"; do
-        echo "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}" >> .env
-    done
+        echo ""
+        echo "# Database passwords por sitio"
+        i=1
+        for domain in "${DOMAINS[@]}"; do
+            echo "DB_PASSWORD_$i=${DB_PASSWORDS[$domain]}"
+            ((i++))
+        done
 
-    # Añadir contraseñas SFTP por sitio
-    echo "" >> .env
-    echo "# SFTP - Usuarios independientes por sitio" >> .env
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}" >> .env
-    done
-
-    chown root:root .env
+        echo ""
+        echo "# SFTP - Usuarios independientes por sitio"
+        for domain in "${DOMAINS[@]}"; do
+            local san="${DOMAIN_CACHE[$domain]}"
+            local san_upper="${san^^}"
+            echo "SFTP_${san_upper}_PASSWORD=${SFTP_PASSWORDS[$domain]}"
+        done
+    } > .env
     chmod 600 .env
+    chown root:root .env
 
-    # Exportar las variables para que estén disponibles en los scripts hijos
-    export MYSQL_ROOT_PASSWORD
-    export SERVER_IP
-    export IP_VERSION
-
-    # Exportar contraseñas DB
-    for i in "${!DOMAINS[@]}"; do
-        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
-    done
-
-    # Exportar contraseñas SFTP
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
-    done
-
-    success "✓ Archivo .env creado"
-    echo ""
-    sleep 2
+    export_credentials
+    success "Credenciales generadas"
 }
 
-# Copiar plantillas y scripts
-copy_templates_and_scripts() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 9: Instalación de plantillas y scripts"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN Y SETUP
+# ══════════════════════════════════════════════════════════════════════════════
 
-    log "Copiando plantillas..."
-    if [[ -d "$SCRIPT_DIR/templates" ]]; then
-        cp -r "$SCRIPT_DIR/templates"/* templates/
-        success "✓ Plantillas copiadas"
-    else
-        warning "Directorio templates/ no encontrado en $SCRIPT_DIR"
-    fi
+copy_templates() {
+    banner "══ PASO 9: Templates y scripts ══"
 
-    log "Copiando scripts..."
-    if [[ -d "$SCRIPT_DIR/scripts" ]]; then
-        cp -r "$SCRIPT_DIR/scripts"/* scripts/
-        chmod +x scripts/*.sh
-        success "✓ Scripts copiados"
-    else
-        warning "Directorio scripts/ no encontrado en $SCRIPT_DIR"
-    fi
+    [[ -d "$SCRIPT_DIR/templates" ]] && cp -r "$SCRIPT_DIR/templates"/* templates/
+    [[ -d "$SCRIPT_DIR/scripts" ]] && { cp -r "$SCRIPT_DIR/scripts"/* scripts/; chmod +x scripts/*.sh; }
 
-    echo ""
-    sleep 2
+    success "Templates copiados"
 }
 
-# Generar configuraciones
-generate_configurations() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 10: Generación de configuraciones"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-
-    log "Generando archivos de configuración..."
-
-    # Asegurar que las variables estén exportadas
-    export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    export SERVER_IP="${SERVER_IP}"
-    export IP_VERSION="${IP_VERSION}"
-
-    # Exportar contraseñas DB
-    for i in "${!DOMAINS[@]}"; do
-        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
-    done
-
-    # Exportar contraseñas SFTP
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
-    done
-
-    ./scripts/generate-config.sh || error "Error al generar configuraciones"
-    success "✓ Configuraciones generadas"
-
-    echo ""
-    sleep 2
+run_configuration() {
+    banner "══ PASO 10: Generación de configuraciones ══"
+    export_credentials
+    ./scripts/generate-config.sh || error "Error en generate-config.sh"
+    success "Configuraciones generadas"
 }
 
-# Setup WordPress
-setup_wordpress() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 11: Instalación de WordPress"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-
-    log "Ejecutando setup de WordPress..."
-    # Asegurar que las variables estén disponibles
-    export MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}"
-    export SERVER_IP="${SERVER_IP}"
-    export IP_VERSION="${IP_VERSION}"
-
-    # Exportar contraseñas DB
-    for i in "${!DOMAINS[@]}"; do
-        export "DB_PASSWORD_$((i+1))=${DB_PASSWORDS[$i]}"
-    done
-
-    # Exportar contraseñas SFTP
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        export "SFTP_${domain_sanitized^^}_PASSWORD=${SFTP_PASSWORDS[$i]}"
-    done
-
-    ./scripts/setup.sh || error "Error en setup de WordPress"
-    success "✓ WordPress instalado"
-
-    echo ""
-    sleep 2
+run_wordpress_setup() {
+    banner "══ PASO 11: WordPress Setup ══"
+    export_credentials
+    ./scripts/setup.sh || error "Error en setup.sh"
+    success "WordPress instalado"
 }
 
-# Configurar permisos de WordPress desde contenedores
+# ══════════════════════════════════════════════════════════════════════════════
+# PERMISOS WORDPRESS (optimizado - un solo loop)
+# ══════════════════════════════════════════════════════════════════════════════
+
 set_wordpress_permissions() {
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 12: Configuración de permisos de WordPress"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+    banner "══ PASO 12: Permisos WordPress ══"
 
-    log "Esperando que los contenedores estén listos..."
-    sleep 5
+    sleep 3  # Esperar contenedores
 
-    log "Configurando permisos desde contenedor PHP..."
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local site_path="$INSTALL_DIR/www/$san"
 
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
+        log "Permisos para $domain..."
 
-        log "Configurando permisos para ${domain} (${domain_sanitized})..."
-
-        # Ejecutar dentro del contenedor PHP
+        # Permisos desde contenedor PHP
         docker compose exec -T php sh -c "
-            # Verificar si el directorio existe
-            if [ -d '/var/www/html/${domain_sanitized}' ]; then
-                echo 'Configurando permisos para ${domain_sanitized}...'
+            [ -d '/var/www/html/$san' ] || exit 0
+            chown -R www-data:www-data /var/www/html/$san
+            find /var/www/html/$san -type d -exec chmod 755 {} \;
+            find /var/www/html/$san -type f -exec chmod 644 {} \;
+            mkdir -p /var/www/html/$san/wp-content/{uploads,plugins,themes,upgrade}
+            chmod -R 775 /var/www/html/$san/wp-content
+        " 2>/dev/null || true
 
-                # Cambiar propietario a www-data (usuario de PHP-FPM)
-                chown -R www-data:www-data /var/www/html/${domain_sanitized}
-
-                # Permisos base
-                find /var/www/html/${domain_sanitized} -type d -exec chmod 755 {} \;
-                find /var/www/html/${domain_sanitized} -type f -exec chmod 644 {} \;
-
-                # Crear directorios necesarios
-                mkdir -p /var/www/html/${domain_sanitized}/wp-content/uploads
-                mkdir -p /var/www/html/${domain_sanitized}/wp-content/plugins
-                mkdir -p /var/www/html/${domain_sanitized}/wp-content/themes
-                mkdir -p /var/www/html/${domain_sanitized}/wp-content/upgrade
-
-                # Permisos COMPLETOS para wp-content (WordPress necesita crear subdirectorios)
-                chmod -R 775 /var/www/html/${domain_sanitized}/wp-content
-                chown -R www-data:www-data /var/www/html/${domain_sanitized}/wp-content
-
-                # Asegurar que uploads tenga permisos recursivos
-                if [ -d '/var/www/html/${domain_sanitized}/wp-content/uploads' ]; then
-                    chmod -R 775 /var/www/html/${domain_sanitized}/wp-content/uploads
-                    find /var/www/html/${domain_sanitized}/wp-content/uploads -type d -exec chmod 775 {} \;
-                    find /var/www/html/${domain_sanitized}/wp-content/uploads -type f -exec chmod 664 {} \;
-                fi
-
-                echo 'Permisos configurados correctamente'
-            else
-                echo 'Advertencia: directorio ${domain_sanitized} no encontrado'
-            fi
-        " || warning "Error al configurar permisos para ${domain_sanitized}"
-
-        # También configurar permisos desde el host para SFTP
-        log "Ajustando permisos desde host para SFTP..."
-        if [[ -d "$INSTALL_DIR/www/${domain_sanitized}/wp-content" ]]; then
-            chmod -R 775 "$INSTALL_DIR/www/${domain_sanitized}/wp-content" 2>/dev/null || true
-        fi
-        success "✓ Permisos configurados para ${domain}"
-    done
-
-    success "✓ Permisos base de WordPress configurados"
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # PERMISOS HÍBRIDOS: Seguros + SFTP Compatible
-    # ═══════════════════════════════════════════════════════════════════════
-    log "Aplicando permisos híbridos (seguros + SFTP compatible)..."
-
-    # El contenedor wordpress:php-fpm-alpine usa UID:GID 82:82 (www-data en Alpine)
-    # SFTP también debe usar 82:82 para compatibilidad
-
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        local site_path="$INSTALL_DIR/www/${domain_sanitized}"
-
+        # Permisos híbridos desde host
         if [[ -d "$site_path" ]]; then
-            log "Aplicando permisos híbridos a ${domain}..."
-
-            # 1. Propietario: 82:82 para todo (compatible SFTP y PHP-FPM Alpine)
             chown -R 82:82 "$site_path"
-
-            # 2. CORE (solo lectura - máxima seguridad): 755 para dirs, 644 para archivos
-            # Esto protege wp-admin, wp-includes y archivos PHP raíz
             find "$site_path" -type d -exec chmod 755 {} \;
             find "$site_path" -type f -exec chmod 644 {} \;
+            [[ -f "$site_path/wp-config.php" ]] && chmod 440 "$site_path/wp-config.php"
 
-            # 3. wp-config.php: permisos más restrictivos (440)
-            if [[ -f "$site_path/wp-config.php" ]]; then
-                chmod 440 "$site_path/wp-config.php"
-            fi
-
-            # 4. WP-CONTENT (escritura habilitada - SFTP compatible): 775/664
+            # wp-content con escritura
             if [[ -d "$site_path/wp-content" ]]; then
-                # Directorio principal wp-content
                 chmod 775 "$site_path/wp-content"
-
-                # Subdirectorios que necesitan escritura
-                for subdir in uploads plugins themes upgrade cache languages; do
-                    if [[ -d "$site_path/wp-content/$subdir" ]]; then
+                for subdir in uploads plugins themes upgrade cache; do
+                    [[ -d "$site_path/wp-content/$subdir" ]] && {
                         find "$site_path/wp-content/$subdir" -type d -exec chmod 775 {} \;
                         find "$site_path/wp-content/$subdir" -type f -exec chmod 664 {} \;
-                    fi
-                done
-
-                # Crear directorios si no existen
-                for subdir in uploads plugins themes upgrade; do
-                    mkdir -p "$site_path/wp-content/$subdir"
-                    chown 82:82 "$site_path/wp-content/$subdir"
-                    chmod 775 "$site_path/wp-content/$subdir"
+                    }
                 done
             fi
-
-            success "✓ Permisos híbridos aplicados a ${domain}"
         fi
+
+        success "$domain"
     done
-
-    echo ""
-    success "✓ PERMISOS HÍBRIDOS CONFIGURADOS"
-    echo ""
-    info "  PROTEGIDO (solo lectura):"
-    info "    • wp-admin/, wp-includes/: 755/644"
-    info "    • Archivos PHP raíz: 644"
-    info "    • wp-config.php: 440"
-    echo ""
-    info "  ESCRITURA HABILITADA (SFTP + WordPress):"
-    info "    • wp-content/uploads/: 775/664"
-    info "    • wp-content/plugins/: 775/664"
-    info "    • wp-content/themes/: 775/664"
-    info "    • wp-content/upgrade/: 775/664"
-    echo ""
-    info "  Propietario: 82:82 (www-data Alpine, compatible SFTP y PHP-FPM)"
-
-    echo ""
-    sleep 2
 }
 
-# Configurar Redis
+# ══════════════════════════════════════════════════════════════════════════════
+# REDIS + COOKIES (CORREGIDO)
+# ══════════════════════════════════════════════════════════════════════════════
+
 setup_redis() {
-    if [[ $INSTALL_REDIS != true ]]; then
-        return 0
-    fi
+    $INSTALL_REDIS || return 0
 
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 13: Instalación de Redis"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+    banner "══ PASO 13: Redis + Cookies ══"
 
-    log "Verificando que Redis esté corriendo..."
-
-    # Verificar que el contenedor Redis esté activo
-    if ! docker compose ps --status running 2>/dev/null | grep -q "redis"; then
-        warning "Contenedor Redis no está corriendo, iniciándolo..."
-        docker compose up -d redis >> "$LOG_FILE" 2>&1 || {
-            error "No se pudo iniciar Redis"
-        }
+    # Verificar/iniciar Redis
+    if ! docker compose ps --status running 2>/dev/null | grep -q redis; then
+        log "Iniciando contenedor Redis..."
+        docker compose up -d redis >> "$LOG_FILE" 2>&1
         sleep 5
     fi
 
-    # Verificar conexión a Redis
-    if docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q "PONG"; then
-        success "✓ Redis está corriendo y responde"
-    else
-        error "Redis no responde"
-    fi
+    # Verificar conexión
+    docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q PONG || error "Redis no responde"
+    success "Redis activo"
 
-    log "Configurando Redis para cada sitio WordPress..."
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        local site_path="$INSTALL_DIR/www/$san"
+        local wp_config="$site_path/wp-config.php"
 
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        local site_path="$INSTALL_DIR/www/${domain_sanitized}"
-        local wp_config_path="$site_path/wp-config.php"
-        local redis_prefix="${domain_sanitized}_"
+        log "Configurando Redis para $domain..."
 
-        log "Configurando Redis para ${domain}..."
+        [[ -f "$wp_config" ]] || { warning "wp-config.php no encontrado para $domain"; continue; }
 
-        # Verificar que existe wp-config.php
-        if [[ ! -f "$wp_config_path" ]]; then
-            warning "wp-config.php no encontrado para ${domain}, saltando..."
-            continue
-        fi
+        # ════════════════════════════════════════════════════════════════
+        # 1. LIMPIAR CONFIGURACIÓN ANTERIOR
+        # ════════════════════════════════════════════════════════════════
+        sed -i '/WP_REDIS_/d; /WP_CACHE/d; /COOKIEHASH/d; /COOKIE_DOMAIN/d' "$wp_config"
+        sed -i '/COOKIEPATH/d; /SITECOOKIEPATH/d; /ADMIN_COOKIE_PATH/d' "$wp_config"
+        sed -i '/PLUGINS_COOKIE_PATH/d; /USER_COOKIE/d; /PASS_COOKIE/d' "$wp_config"
+        sed -i '/AUTH_COOKIE/d; /SECURE_AUTH_COOKIE/d; /LOGGED_IN_COOKIE/d; /TEST_COOKIE/d' "$wp_config"
+        sed -i '/Redis Object Cache/d; /Cookie Configuration/d' "$wp_config"
+        sed -i '/^$/N;/^\n$/d' "$wp_config"
 
-        # Verificar si ya está configurado
-        if grep -q "WP_REDIS_HOST" "$wp_config_path" 2>/dev/null; then
-            info "Redis ya configurado en ${domain}"
-            continue
-        fi
+        # ════════════════════════════════════════════════════════════════
+        # 2. GENERAR CONFIGURACIÓN COMPLETA
+        # ════════════════════════════════════════════════════════════════
+        local cookie_hash site_domain
+        cookie_hash=$(echo -n "$san" | md5sum | cut -c1-8)
+        site_domain="${san//_/.}"
 
-        # Insertar configuración de Redis usando método robusto
-        # Crear archivo temporal con la configuración
-        local temp_config=$(mktemp)
-        cat > "$temp_config" << REDIS_EOF
+        local config_block
+        read -r -d '' config_block << CONFIGEOF || true
 
-/* Redis Object Cache Configuration */
+/* Redis Object Cache Configuration - $domain */
 define('WP_REDIS_CLIENT', 'predis');
 define('WP_REDIS_HOST', 'redis');
 define('WP_REDIS_PORT', 6379);
-define('WP_REDIS_PREFIX', '${redis_prefix}');
+define('WP_REDIS_PREFIX', '${san}_');
 define('WP_REDIS_DATABASE', 0);
 define('WP_REDIS_TIMEOUT', 1);
 define('WP_REDIS_READ_TIMEOUT', 1);
 define('WP_CACHE', true);
 
-REDIS_EOF
-
-        # Insertar antes de "That's all, stop editing!" o "require_once ABSPATH"
-        if grep -q "That's all, stop editing!" "$wp_config_path"; then
-            # Obtener número de línea
-            local line_num=$(grep -n "That's all, stop editing!" "$wp_config_path" | head -1 | cut -d: -f1)
-            # Insertar configuración antes de esa línea
-            head -n $((line_num - 1)) "$wp_config_path" > "${wp_config_path}.new"
-            cat "$temp_config" >> "${wp_config_path}.new"
-            tail -n +${line_num} "$wp_config_path" >> "${wp_config_path}.new"
-            mv "${wp_config_path}.new" "$wp_config_path"
-        elif grep -q "require_once ABSPATH" "$wp_config_path"; then
-            local line_num=$(grep -n "require_once ABSPATH" "$wp_config_path" | head -1 | cut -d: -f1)
-            head -n $((line_num - 1)) "$wp_config_path" > "${wp_config_path}.new"
-            cat "$temp_config" >> "${wp_config_path}.new"
-            tail -n +${line_num} "$wp_config_path" >> "${wp_config_path}.new"
-            mv "${wp_config_path}.new" "$wp_config_path"
-        else
-            # Si no encuentra ninguno, agregar antes del cierre de PHP o al final
-            cat "$temp_config" >> "$wp_config_path"
-        fi
-
-        rm -f "$temp_config"
-
-        # Corregir permisos del archivo
-        chown 82:82 "$wp_config_path"
-        chmod 440 "$wp_config_path"
-
-        # Descargar e instalar plugin Redis Object Cache
-        docker compose exec -T php sh -c "
-            cd /var/www/html/${domain_sanitized}
-
-            # Crear directorio de plugins si no existe
-            mkdir -p wp-content/plugins
-
-            # Descargar plugin si no existe
-            if [ ! -d 'wp-content/plugins/redis-cache' ]; then
-                cd wp-content/plugins
-                wget -q https://downloads.wordpress.org/plugin/redis-cache.latest-stable.zip -O redis-cache.zip 2>/dev/null
-                if [ -f redis-cache.zip ]; then
-                    unzip -q redis-cache.zip 2>/dev/null
-                    rm -f redis-cache.zip
-                fi
-            fi
-
-            # Copiar object-cache.php drop-in
-            if [ -f 'wp-content/plugins/redis-cache/includes/object-cache.php' ]; then
-                cp wp-content/plugins/redis-cache/includes/object-cache.php wp-content/object-cache.php 2>/dev/null
-            fi
-        " >> "$LOG_FILE" 2>&1 || warning "No se pudo instalar plugin automáticamente para ${domain}"
-
-        # Corregir permisos
-        chown -R 82:82 "$site_path/wp-content/plugins/" 2>/dev/null || true
-        chown 82:82 "$site_path/wp-content/object-cache.php" 2>/dev/null || true
-
-        success "✓ Redis configurado para ${domain}"
-    done
-
-    echo ""
-    success "✓ Redis instalado y configurado"
-    info "  - Host: redis"
-    info "  - Puerto: 6379"
-    info "  - Cada sitio tiene su propio prefijo de caché"
-    info "  - Plugin: Redis Object Cache (activar desde wp-admin)"
-
-    echo ""
-    sleep 2
-}
-
-# Configurar Redis y Cookies de forma unificada y robusta
-configure_redis_and_cookies() {
-    if [[ $INSTALL_REDIS != true ]]; then
-        return 0
-    fi
-
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 13B: Configuración unificada de Redis y Cookies"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-
-    log "Aplicando configuración unificada de Redis y Cookies..."
-    cd "$INSTALL_DIR"
-
-    for dir in www/*/; do
-        local site_name=$(basename "$dir")
-        local wp_config="${dir}wp-config.php"
-
-        [[ ! -f "$wp_config" ]] && continue
-
-        echo ""
-        info "=== Procesando: $site_name ==="
-
-        # Generar hash único
-        local cookie_hash=$(echo -n "$site_name" | md5sum | cut -c1-8)
-        local site_domain=$(echo "$site_name" | sed 's/_/./g')
-
-        # Eliminar TODA configuración anterior de Redis y Cookies (esté donde esté)
-        log "Limpiando configuración anterior..."
-        sed -i '/WP_REDIS_/d' "$wp_config"
-        sed -i '/WP_CACHE/d' "$wp_config"
-        sed -i '/COOKIEHASH/d' "$wp_config"
-        sed -i '/COOKIE_DOMAIN/d' "$wp_config"
-        sed -i '/COOKIEPATH/d' "$wp_config"
-        sed -i '/SITECOOKIEPATH/d' "$wp_config"
-        sed -i '/ADMIN_COOKIE_PATH/d' "$wp_config"
-        sed -i '/PLUGINS_COOKIE_PATH/d' "$wp_config"
-        sed -i '/USER_COOKIE/d' "$wp_config"
-        sed -i '/PASS_COOKIE/d' "$wp_config"
-        sed -i '/AUTH_COOKIE/d' "$wp_config"
-        sed -i '/SECURE_AUTH_COOKIE/d' "$wp_config"
-        sed -i '/LOGGED_IN_COOKIE/d' "$wp_config"
-        sed -i '/TEST_COOKIE/d' "$wp_config"
-        sed -i '/Redis Object Cache/d' "$wp_config"
-        sed -i '/Cookie Configuration/d' "$wp_config"
-
-        # Eliminar líneas vacías múltiples al final
-        sed -i ':a;/^[[:space:]]*$/{$d;N;ba}' "$wp_config"
-
-        # Crear configuración completa
-        local config_content=$(cat << CONFIGEOF
-
-/* Redis Object Cache Configuration */
-define('WP_REDIS_CLIENT', 'predis');
-define('WP_REDIS_HOST', 'redis');
-define('WP_REDIS_PORT', 6379);
-define('WP_REDIS_PREFIX', '${site_name}_');
-define('WP_REDIS_DATABASE', 0);
-define('WP_REDIS_TIMEOUT', 1);
-define('WP_REDIS_READ_TIMEOUT', 1);
-define('WP_CACHE', true);
-
-/* Cookie Configuration - Unique for ${site_name} */
-define('COOKIE_DOMAIN', '${site_domain}');
+/* Cookie Configuration - $domain (hash: $cookie_hash) */
+define('COOKIE_DOMAIN', '$site_domain');
 define('COOKIEPATH', '/');
 define('SITECOOKIEPATH', '/');
 define('ADMIN_COOKIE_PATH', '/wp-admin');
 define('PLUGINS_COOKIE_PATH', '/wp-content/plugins');
-define('COOKIEHASH', '${cookie_hash}');
-define('USER_COOKIE', 'wpuser_${cookie_hash}');
-define('PASS_COOKIE', 'wppass_${cookie_hash}');
-define('AUTH_COOKIE', 'wpauth_${cookie_hash}');
-define('SECURE_AUTH_COOKIE', 'wpsecauth_${cookie_hash}');
-define('LOGGED_IN_COOKIE', 'wplogin_${cookie_hash}');
-define('TEST_COOKIE', 'wptest_${cookie_hash}');
+define('COOKIEHASH', '$cookie_hash');
+define('USER_COOKIE', 'wpuser_$cookie_hash');
+define('PASS_COOKIE', 'wppass_$cookie_hash');
+define('AUTH_COOKIE', 'wpauth_$cookie_hash');
+define('SECURE_AUTH_COOKIE', 'wpsecauth_$cookie_hash');
+define('LOGGED_IN_COOKIE', 'wplogin_$cookie_hash');
+define('TEST_COOKIE', 'wptest_$cookie_hash');
 
 CONFIGEOF
-)
 
-        # Insertar ANTES de "if ( !defined('ABSPATH') )"
-        if grep -q "if ( !defined('ABSPATH') )" "$wp_config"; then
-            local line_num=$(grep -n "if ( !defined('ABSPATH') )" "$wp_config" | head -1 | cut -d: -f1)
-            head -n $((line_num - 1)) "$wp_config" > "${wp_config}.new"
-            echo "$config_content" >> "${wp_config}.new"
-            tail -n +${line_num} "$wp_config" >> "${wp_config}.new"
-            mv "${wp_config}.new" "$wp_config"
-            success "  ✓ Configuración insertada antes de ABSPATH"
+        # ════════════════════════════════════════════════════════════════
+        # 3. INSERTAR EN WP-CONFIG (método robusto)
+        # ════════════════════════════════════════════════════════════════
+        local insert_marker="" line_num=0
+
+        # Buscar mejor punto de inserción
+        for marker in "That's all, stop editing!" "if ( ! defined( 'ABSPATH' ) )" \
+                      "if ( !defined('ABSPATH') )" "require_once ABSPATH"; do
+            if grep -qF "$marker" "$wp_config"; then
+                insert_marker="$marker"
+                break
+            fi
+        done
+
+        if [[ -n "$insert_marker" ]]; then
+            line_num=$(grep -nF "$insert_marker" "$wp_config" | head -1 | cut -d: -f1)
+            if [[ -n "$line_num" && "$line_num" -gt 0 ]]; then
+                { head -n $((line_num - 1)) "$wp_config"; echo "$config_block"; tail -n +"$line_num" "$wp_config"; } > "${wp_config}.new"
+                mv "${wp_config}.new" "$wp_config"
+            else
+                echo "$config_block" >> "$wp_config"
+            fi
         else
-            warning "  ✗ No se encontró la línea ABSPATH, insertando al final"
-            echo "$config_content" >> "$wp_config"
+            echo "$config_block" >> "$wp_config"
         fi
 
-        chown 82:82 "$wp_config"
-        chmod 440 "$wp_config"
+        # ════════════════════════════════════════════════════════════════
+        # 4. INSTALAR PLUGIN (desde HOST, no desde contenedor)
+        # ════════════════════════════════════════════════════════════════
+        local plugin_dir="$site_path/wp-content/plugins"
+        local plugin_path="$plugin_dir/redis-cache"
 
-        success "  ✓ Cookie hash: $cookie_hash"
-        success "  ✓ Domain: $site_domain"
+        mkdir -p "$plugin_dir"
+
+        if [[ ! -d "$plugin_path" ]]; then
+            local plugin_zip="/tmp/redis-cache-${san}.zip"
+            if curl -fsSL "https://downloads.wordpress.org/plugin/redis-cache.latest-stable.zip" -o "$plugin_zip" 2>/dev/null; then
+                unzip -q -o "$plugin_zip" -d "$plugin_dir" 2>/dev/null && rm -f "$plugin_zip"
+                [[ -d "$plugin_path" ]] && success "  Plugin instalado" || warning "  Error extrayendo plugin"
+            else
+                warning "  No se pudo descargar plugin (instalar desde wp-admin)"
+            fi
+        fi
+
+        # ════════════════════════════════════════════════════════════════
+        # 5. COPIAR DROP-IN
+        # ════════════════════════════════════════════════════════════════
+        local dropin_src="$plugin_path/includes/object-cache.php"
+        local dropin_dst="$site_path/wp-content/object-cache.php"
+
+        [[ -f "$dropin_src" ]] && cp "$dropin_src" "$dropin_dst" && success "  Drop-in copiado"
+
+        # ════════════════════════════════════════════════════════════════
+        # 6. PERMISOS
+        # ════════════════════════════════════════════════════════════════
+        chown 82:82 "$wp_config" && chmod 440 "$wp_config"
+        [[ -d "$plugin_path" ]] && { chown -R 82:82 "$plugin_path"; chmod -R 755 "$plugin_path"; find "$plugin_path" -type f -exec chmod 644 {} \;; }
+        [[ -f "$dropin_dst" ]] && { chown 82:82 "$dropin_dst"; chmod 644 "$dropin_dst"; }
+
+        success "✓ $domain (hash: $cookie_hash, prefix: ${san}_)"
     done
 
     echo ""
-    success "✓ Configuración unificada de Redis y Cookies completada"
-    echo ""
-    sleep 2
+    info "Activar en wp-admin: Plugins > Redis Object Cache > Enable"
+    info "Comandos: docker compose exec redis redis-cli INFO stats"
 }
 
-# Configurar backup automático
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKUP CRON
+# ══════════════════════════════════════════════════════════════════════════════
+
 configure_backup() {
-    if [[ $SETUP_CRON != true ]]; then
-        return 0
-    fi
+    $SETUP_CRON || return 0
 
-    banner "═══════════════════════════════════════════════════════════════════════"
-    banner "  PASO 14: Configuración de backup automático"
-    banner "═══════════════════════════════════════════════════════════════════════"
-    echo ""
+    banner "══ PASO 14: Backup automático ══"
 
-    # Verificar que el script de backup existe
-    if [[ ! -f "$INSTALL_DIR/scripts/backup.sh" ]]; then
-        error "Script de backup no encontrado en $INSTALL_DIR/scripts/backup.sh"
-    fi
-
-    # Asegurar permisos de ejecución
+    [[ -f "$INSTALL_DIR/scripts/backup.sh" ]] || error "backup.sh no encontrado"
     chmod +x "$INSTALL_DIR/scripts/backup.sh"
-
-    # Crear directorio de logs
     mkdir -p "$INSTALL_DIR/logs"
-    chmod 755 "$INSTALL_DIR/logs"
 
-    log "Configurando cron con variables de entorno..."
-
-    # Crear archivo temporal con el cron completo
-    local temp_cron=$(mktemp)
-
-    # Obtener crontab actual y eliminar entradas antiguas de backup
-    crontab -l -u root 2>/dev/null | grep -v "backup.sh" | grep -v "^PATH=" | grep -v "^SHELL=" > "$temp_cron" || true
-
-    # Agregar variables de entorno y tarea cron mejorada
-    cat >> "$temp_cron" << 'CRON_EOF'
-# Variables de entorno para tareas cron
+    # Configurar cron
+    (crontab -l 2>/dev/null | grep -v "backup.sh"; cat << EOF
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-SHELL=/bin/bash
+0 6 * * * cd $INSTALL_DIR && ./scripts/backup.sh >> $INSTALL_DIR/logs/backup.log 2>&1
+EOF
+    ) | crontab -
 
-# Backup automático diario de WordPress Multi-Site (2:00 AM)
-CRON_EOF
-
-    # Agregar la entrada de cron con creación del directorio de logs
-    echo "0 2 * * * mkdir -p $INSTALL_DIR/logs && cd $INSTALL_DIR && ./scripts/backup.sh >> $INSTALL_DIR/logs/backup.log 2>&1" >> "$temp_cron"
-
-    # Instalar el nuevo crontab
-    crontab -u root "$temp_cron"
-    rm -f "$temp_cron"
-
-    # Reiniciar el servicio cron
-    systemctl restart cron || systemctl restart crond
-
-    # Verificar configuración
-    if crontab -l 2>/dev/null | grep -q "backup.sh"; then
-        success "✓ Backup automático configurado (2:00 AM diario)"
-        success "✓ Variables de entorno PATH y SHELL configuradas"
-        success "✓ Script backup.sh verificado con permisos de ejecución"
-        success "✓ Directorio de logs creado en $INSTALL_DIR/logs"
-
-        info "Configuración del cron:"
-        echo ""
-        crontab -l 2>/dev/null | grep -E "(PATH=|SHELL=|backup.sh)" | sed 's/^/  /'
-        echo ""
-
-        info "Prueba manual del backup:"
-        echo "  cd $INSTALL_DIR && sudo ./scripts/backup.sh"
-    else
-        error "El cron no se configuró correctamente"
-    fi
-
-    echo ""
-    sleep 2
+    systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
+    success "Backup diario configurado (6:00 AM)"
 }
 
-# Resumen final
-show_final_summary() {
-    banner "╔═══════════════════════════════════════════════════════════════════════╗"
-    banner "║                   ✓ INSTALACIÓN COMPLETADA ✓                         ║"
-    banner "╚═══════════════════════════════════════════════════════════════════════╝"
-    echo ""
+# ══════════════════════════════════════════════════════════════════════════════
+# RESUMEN FINAL (compacto)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    success "Instalado en: $INSTALL_DIR"
-    echo ""
+show_summary() {
+    banner "╔══════════════════════════════════════════════════════════════════════╗"
+    banner "║                    ✓ INSTALACIÓN COMPLETADA ✓                        ║"
+    banner "╚══════════════════════════════════════════════════════════════════════╝"
 
-    info "═══ CREDENCIALES ═══"
-    echo "  MySQL Root: root / $MYSQL_ROOT_PASSWORD"
-    echo ""
-    echo "  Credenciales por sitio:"
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo ""
-        echo "    ${domain}:"
-        echo "      Carpeta: ${domain_sanitized}"
-        echo "      DB: ${domain_sanitized}"
-        echo "      Usuario DB: wpuser_${domain_sanitized} / ${DB_PASSWORDS[$i]}"
-        echo "      Usuario SFTP: sftp_${domain_sanitized} / ${SFTP_PASSWORDS[$i]}"
-    done
-    echo ""
-    warning "  También en: $INSTALL_DIR/.credentials"
-    echo ""
+    echo -e "\n${GREEN}Credenciales:${NC}"
+    echo "  MySQL Root: $MYSQL_ROOT_PASSWORD"
 
-    info "═══ SITIOS CONFIGURADOS ═══"
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo "  $((i+1)). ${domain}"
-        echo "     URL: http://${domain}"
-        echo "     Carpeta: ${domain_sanitized}"
-        echo ""
+    for domain in "${DOMAINS[@]}"; do
+        local san="${DOMAIN_CACHE[$domain]}"
+        echo -e "\n  ${CYAN}$domain${NC} → $san"
+        echo "    DB: wpuser_$san / ${DB_PASSWORDS[$domain]}"
+        echo "    SFTP: sftp_$san / ${SFTP_PASSWORDS[$domain]}"
     done
 
-    info "═══ SERVICIOS ═══"
+    echo -e "\n${GREEN}Servicios:${NC}"
     echo "  phpMyAdmin: http://${DOMAINS[0]}/phpmyadmin/"
     echo "  SFTP: $SERVER_IP:2222"
+    $INSTALL_NETDATA && echo "  Netdata: ssh -L 19999:localhost:19999 root@$SERVER_IP"
+    $INSTALL_REDIS && echo "  Redis: docker compose exec redis redis-cli INFO"
 
-    if [[ $INSTALL_NETDATA == true ]]; then
-        echo ""
-        info "  Netdata (solo accesible por túnel SSH):"
-        echo "    Comando: ssh -L 19999:localhost:19999 root@$SERVER_IP"
-        echo "    Luego en navegador: http://localhost:19999"
-    fi
+    echo -e "\n${GREEN}Próximos pasos:${NC}"
+    echo "  1. DNS → $SERVER_IP"
+    echo "  2. SSL: cd $INSTALL_DIR && ./scripts/setup-ssl.sh"
+    echo "  3. WordPress: http://DOMINIO/wp-admin/install.php"
 
-    if [[ $INSTALL_REDIS == true ]]; then
-        echo ""
-        info "  Redis (caché de objetos):"
-        echo "    Host interno: redis:6379"
-        echo "    Plugin: Redis Object Cache (activar en cada wp-admin)"
-        echo "    Ver estado: docker compose exec redis redis-cli INFO"
-        echo "    Limpiar caché: docker compose exec redis redis-cli FLUSHALL"
-    fi
-
-    echo ""
-    echo "  Accesos SFTP por sitio:"
-    for i in "${!DOMAINS[@]}"; do
-        local domain="${DOMAINS[$i]}"
-        local domain_sanitized=$(sanitize_domain_name "$domain")
-        echo "    ${domain}: sftp -P 2222 sftp_${domain_sanitized}@$SERVER_IP"
-        echo "    Directorio: /${domain_sanitized}"
-    done
-    echo ""
-
-    info "═══ PRÓXIMOS PASOS ═══"
-    echo "  1. Apuntar DNS a: $SERVER_IP ($IP_VERSION)"
-    echo "  2. Ejecutar: cd $INSTALL_DIR && sudo ./scripts/setup-ssl.sh"
-    echo "  3. Instalar WordPress en cada dominio:"
-    for domain in "${DOMAINS[@]}"; do
-        echo "     - http://$domain/wp-admin/install.php"
-    done
-    echo ""
-
-    info "═══ COMANDOS ═══"
-    echo "  Ver estado: cd $INSTALL_DIR && docker compose ps"
-    echo "  Ver logs: docker compose logs -f"
-    echo "  Backup: ./scripts/backup.sh"
-    if [[ $INSTALL_NETDATA == true ]]; then
-        echo "  Netdata: systemctl status netdata"
-    fi
-    if [[ $INSTALL_REDIS == true ]]; then
-        echo "  Redis status: docker compose exec redis redis-cli INFO"
-        echo "  Redis config: ./scripts/setup-redis.sh"
-    fi
-    echo ""
-
-    success "¡Sistema WordPress multi-sitio listo!"
-    echo ""
+    echo -e "\n${YELLOW}Credenciales guardadas en: $INSTALL_DIR/.credentials${NC}\n"
 }
 
-# Main
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 main() {
-    check_root
-    show_main_banner
-    verify_system_requirements
-    gather_user_input
-    update_system
+    mkdir -p "$(dirname "$LOG_FILE")"
+
+    check_prerequisites
+    gather_interactive_input
+    install_packages
     install_docker
     configure_firewall
     install_netdata
-    create_directories
-    check_existing_mysql
-    generate_credentials
-    copy_templates_and_scripts
-    generate_configurations
-    setup_wordpress
+    setup_structure
+    check_mysql_volume
+    generate_all_credentials
+    copy_templates
+    run_configuration
+    run_wordpress_setup
     set_wordpress_permissions
     setup_redis
-    configure_redis_and_cookies  # ← NUEVA FUNCIÓN: Configuración unificada
     configure_backup
-    show_final_summary
+    show_summary
 }
 
 main "$@"

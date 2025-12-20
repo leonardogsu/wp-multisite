@@ -770,7 +770,7 @@ EOF
     ) | crontab -
 
     systemctl restart cron 2>/dev/null || systemctl restart crond 2>/dev/null || true
-    success "Backup diario configurado (2:00 AM)"
+    success "Backup diario configurado (6:00 AM)"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
